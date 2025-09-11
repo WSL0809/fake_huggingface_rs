@@ -1,76 +1,37 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH, Instant};
-use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use async_stream::stream;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxPath, Request as AxRequest, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get};
+use axum::routing::get;
 use axum::{Json, Router};
-use serde::{Deserialize};
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::RwLock;
 use tracing::{error, info};
-use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 use uuid::Uuid;
-use sha2::{Sha256, Digest};
-use hex;
 
-#[derive(Clone)]
-struct AppState {
-    root: Arc<PathBuf>,
-    // logging options
-    log_requests: bool,
-    log_body_max: usize,
-    log_headers_mode_all: bool,
-    log_resp_headers: bool,
-    log_redact: bool,
-    log_body_all: bool,
-    // cache options
-    cache_ttl: Duration,
-    paths_info_cache_cap: usize,
-    siblings_cache_cap: usize,
-    sha256_cache_cap: usize,
-}
+mod app_state;
+mod caches;
 
-// In-memory sidecar cache
-type SidecarMap = HashMap<String, Value>; // rel_path (posix) -> entry
-#[derive(Default)]
-struct SidecarCache {
-    // key: (abs_path, mtime_secs, size)
-    inner: HashMap<(PathBuf, u64, u64), SidecarMap>,
-}
-
-static SIDECAR_CACHE: once_cell::sync::Lazy<RwLock<SidecarCache>> =
-    once_cell::sync::Lazy::new(|| RwLock::new(SidecarCache::default()));
+use app_state::AppState;
+use caches::{
+    PATHS_INFO_CACHE, PathsInfoEntry, SHA256_CACHE, SIBLINGS_CACHE, SIDECAR_CACHE, Sha256Entry,
+    SiblingsEntry, SidecarMap,
+};
 
 const CHUNK_SIZE: usize = 262_144; // 256 KiB per read chunk
-
-#[derive(Clone)]
-struct SiblingsEntry { siblings: Vec<Value>, total: u64, at: Instant }
-
-static SIBLINGS_CACHE: once_cell::sync::Lazy<RwLock<HashMap<String, SiblingsEntry>>> =
-    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
-
-#[derive(Clone)]
-struct PathsInfoEntry { items: Vec<Value>, at: Instant }
-
-static PATHS_INFO_CACHE: once_cell::sync::Lazy<RwLock<HashMap<String, PathsInfoEntry>>> =
-    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
-
-#[derive(Clone)]
-struct Sha256Entry { sum: String, at: Instant }
-
-static SHA256_CACHE: once_cell::sync::Lazy<RwLock<HashMap<(PathBuf, u64, u64), Sha256Entry>>> =
-    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
 #[tokio::main]
 async fn main() {
@@ -81,16 +42,45 @@ async fn main() {
 
     let state = AppState {
         root: Arc::new(root_abs.clone()),
-        log_requests: !matches!(env::var("LOG_REQUESTS").as_deref(), Ok("0") | Ok("false") | Ok("False")),
-        log_body_max: env::var("LOG_BODY_MAX").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096),
-        log_headers_mode_all: matches!(env::var("LOG_HEADERS").as_deref(), Ok("all") ),
-        log_resp_headers: !matches!(env::var("LOG_RESP_HEADERS").as_deref(), Ok("0") | Ok("false") | Ok("False")),
-        log_redact: !matches!(env::var("LOG_REDACT").as_deref(), Ok("0") | Ok("false") | Ok("False")),
-        log_body_all: !matches!(env::var("LOG_BODY_ALL").as_deref(), Ok("0") | Ok("false") | Ok("False")),
-        cache_ttl: Duration::from_millis(env::var("CACHE_TTL_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2_000)),
-        paths_info_cache_cap: env::var("PATHS_INFO_CACHE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(512),
-        siblings_cache_cap: env::var("SIBLINGS_CACHE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(256),
-        sha256_cache_cap: env::var("SHA256_CACHE_CAP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1024),
+        log_requests: !matches!(
+            env::var("LOG_REQUESTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("False")
+        ),
+        log_body_max: env::var("LOG_BODY_MAX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4096),
+        log_headers_mode_all: matches!(env::var("LOG_HEADERS").as_deref(), Ok("all")),
+        log_resp_headers: !matches!(
+            env::var("LOG_RESP_HEADERS").as_deref(),
+            Ok("0") | Ok("false") | Ok("False")
+        ),
+        log_redact: !matches!(
+            env::var("LOG_REDACT").as_deref(),
+            Ok("0") | Ok("false") | Ok("False")
+        ),
+        log_body_all: !matches!(
+            env::var("LOG_BODY_ALL").as_deref(),
+            Ok("0") | Ok("false") | Ok("False")
+        ),
+        cache_ttl: Duration::from_millis(
+            env::var("CACHE_TTL_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(2_000),
+        ),
+        paths_info_cache_cap: env::var("PATHS_INFO_CACHE_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(512),
+        siblings_cache_cap: env::var("SIBLINGS_CACHE_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(256),
+        sha256_cache_cap: env::var("SHA256_CACHE_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1024),
     };
 
     println!("[fake-hub] FAKE_HUB_ROOT = {}", root_abs.display());
@@ -98,9 +88,15 @@ async fn main() {
     // Build router
     let app = Router::new()
         // Datasets catch-all under /api/datasets
-        .route("/api/datasets/{*rest}", get(get_dataset_catchall_get).post(get_dataset_paths_info_post))
+        .route(
+            "/api/datasets/{*rest}",
+            get(get_dataset_catchall_get).post(get_dataset_paths_info_post),
+        )
         // Models catch-all under /api/models
-        .route("/api/models/{*rest}", get(get_model_catchall_get).post(get_model_paths_info_post))
+        .route(
+            "/api/models/{*rest}",
+            get(get_model_catchall_get).post(get_model_paths_info_post),
+        )
         // Resolve route fallback: GET and HEAD
         .route("/{*rest}", get(resolve_catchall).head(resolve_catchall))
         .with_state(state.clone())
@@ -147,7 +143,10 @@ async fn log_requests_mw(
     if state.log_headers_mode_all {
         for (k, v) in headers.iter() {
             let val = v.to_str().unwrap_or("");
-            hdr_map.insert(k.to_string(), json!(redact_header(&k.to_string(), val, state.log_redact)));
+            hdr_map.insert(
+                k.to_string(),
+                json!(redact_header(&k.to_string(), val, state.log_redact)),
+            );
         }
     } else {
         let minimal = [
@@ -173,7 +172,8 @@ async fn log_requests_mw(
 
     // Optionally log JSON body
     let mut body_snippet: Option<String> = None;
-    let should_log_body = state.log_body_all || ct.to_ascii_lowercase().contains("application/json");
+    let should_log_body =
+        state.log_body_all || ct.to_ascii_lowercase().contains("application/json");
     if should_log_body {
         let (parts, body) = req.into_parts();
         match axum::body::to_bytes(body, state.log_body_max).await {
@@ -237,7 +237,10 @@ async fn log_requests_mw(
         let mut hdrs = serde_json::Map::new();
         for (k, v) in resp.headers().iter() {
             let val = v.to_str().unwrap_or("");
-            hdrs.insert(k.to_string(), json!(redact_header(&k.to_string(), val, state.log_redact)));
+            hdrs.insert(
+                k.to_string(),
+                json!(redact_header(&k.to_string(), val, state.log_redact)),
+            );
         }
         info!(target: "fakehub", "[{}] Response headers: {}", req_id, serde_json::to_string(&hdrs).unwrap_or_default());
     }
@@ -322,7 +325,12 @@ async fn build_model_response(
     if !repo_path.is_dir() {
         return Err(http_not_found("Repository not found"));
     }
-    let cache_key = format!("model:{}", dunce::canonicalize(&repo_path).unwrap_or(repo_path.clone()).display());
+    let cache_key = format!(
+        "model:{}",
+        dunce::canonicalize(&repo_path)
+            .unwrap_or(repo_path.clone())
+            .display()
+    );
     let now = Instant::now();
     // Try cache
     if let Some(hit) = {
@@ -379,20 +387,42 @@ async fn build_model_response(
                     dirs.push(path);
                     continue;
                 }
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) { if name == ".paths-info.json" { continue; } }
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    if name == ".paths-info.json" {
+                        continue;
+                    }
+                }
                 let rel = pathdiff::diff_paths(&path, &repo_path).unwrap_or(path.clone());
                 let rel_norm = rel.to_string_lossy().replace('\\', "/");
                 siblings.push(json!({"rfilename": rel_norm}));
-                if let Ok(md) = ent.metadata().await { total_size = total_size.saturating_add(md.len()); }
+                if let Ok(md) = ent.metadata().await {
+                    total_size = total_size.saturating_add(md.len());
+                }
             }
         }
     }
-    siblings.sort_by(|a, b| a["rfilename"].as_str().unwrap_or("").cmp(b["rfilename"].as_str().unwrap_or("")));
+    siblings.sort_by(|a, b| {
+        a["rfilename"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["rfilename"].as_str().unwrap_or(""))
+    });
     // Insert to cache (bounded)
     {
         let mut cache = SIBLINGS_CACHE.write().await;
-        if cache.len() >= state.siblings_cache_cap { if let Some(first_key) = cache.keys().next().cloned() { cache.remove(&first_key); } }
-        cache.insert(cache_key, SiblingsEntry { siblings: siblings.clone(), total: total_size, at: now });
+        if cache.len() >= state.siblings_cache_cap {
+            if let Some(first_key) = cache.keys().next().cloned() {
+                cache.remove(&first_key);
+            }
+        }
+        cache.insert(
+            cache_key,
+            SiblingsEntry {
+                siblings: siblings.clone(),
+                total: total_size,
+                at: now,
+            },
+        );
     }
 
     let fake_sha = revision
@@ -487,9 +517,17 @@ async fn build_dataset_response(
     if !ds_path.is_dir() {
         return Err(http_not_found("Dataset not found"));
     }
-    let cache_key = format!("dataset:{}", dunce::canonicalize(&ds_path).unwrap_or(ds_path.clone()).display());
+    let cache_key = format!(
+        "dataset:{}",
+        dunce::canonicalize(&ds_path)
+            .unwrap_or(ds_path.clone())
+            .display()
+    );
     let now = Instant::now();
-    if let Some(hit) = { let cache = SIBLINGS_CACHE.read().await; cache.get(&cache_key).cloned() } {
+    if let Some(hit) = {
+        let cache = SIBLINGS_CACHE.read().await;
+        cache.get(&cache_key).cloned()
+    } {
         if now.duration_since(hit.at) < state.cache_ttl {
             let fake_sha = revision
                 .map(|r| format!("fakesha-{}", r))
@@ -526,19 +564,41 @@ async fn build_dataset_response(
                     dirs.push(path);
                     continue;
                 }
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) { if name == ".paths-info.json" { continue; } }
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    if name == ".paths-info.json" {
+                        continue;
+                    }
+                }
                 let rel = pathdiff::diff_paths(&path, &ds_path).unwrap_or(path.clone());
                 let rel_norm = rel.to_string_lossy().replace('\\', "/");
                 siblings.push(json!({"rfilename": rel_norm}));
-                if let Ok(md) = ent.metadata().await { total_size = total_size.saturating_add(md.len()); }
+                if let Ok(md) = ent.metadata().await {
+                    total_size = total_size.saturating_add(md.len());
+                }
             }
         }
     }
-    siblings.sort_by(|a, b| a["rfilename"].as_str().unwrap_or("").cmp(b["rfilename"].as_str().unwrap_or("")));
+    siblings.sort_by(|a, b| {
+        a["rfilename"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["rfilename"].as_str().unwrap_or(""))
+    });
     {
         let mut cache = SIBLINGS_CACHE.write().await;
-        if cache.len() >= state.siblings_cache_cap { if let Some(first_key) = cache.keys().next().cloned() { cache.remove(&first_key); } }
-        cache.insert(cache_key, SiblingsEntry { siblings: siblings.clone(), total: total_size, at: now });
+        if cache.len() >= state.siblings_cache_cap {
+            if let Some(first_key) = cache.keys().next().cloned() {
+                cache.remove(&first_key);
+            }
+        }
+        cache.insert(
+            cache_key,
+            SiblingsEntry {
+                siblings: siblings.clone(),
+                total: total_size,
+                at: now,
+            },
+        );
     }
 
     let fake_sha = revision
@@ -575,16 +635,26 @@ struct PathsInfoBody {
     expand: Option<bool>,
 }
 
-async fn paths_info_response(state: &AppState, base_dir: &Path, req: AxRequest) -> Result<Vec<Value>, Response> {
+async fn paths_info_response(
+    state: &AppState,
+    base_dir: &Path,
+    req: AxRequest,
+) -> Result<Vec<Value>, Response> {
     // parse JSON body if any
     let (_parts, body) = req.into_parts();
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_else(|_| Bytes::new());
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_else(|_| Bytes::new());
     let mut paths: Vec<String> = Vec::new();
     let mut expand = true;
     if !body_bytes.is_empty() {
         if let Ok(body) = serde_json::from_slice::<PathsInfoBody>(&body_bytes) {
-            if let Some(p) = body.paths { paths = p.into_iter().filter(|s| !s.is_empty()).collect(); }
-            if let Some(e) = body.expand { expand = e; }
+            if let Some(p) = body.paths {
+                paths = p.into_iter().filter(|s| !s.is_empty()).collect();
+            }
+            if let Some(e) = body.expand {
+                expand = e;
+            }
         }
     }
 
@@ -594,18 +664,34 @@ async fn paths_info_response(state: &AppState, base_dir: &Path, req: AxRequest) 
     let (sc_mtime, sc_size) = sidecar
         .metadata()
         .ok()
-        .and_then(|m| m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| (d.as_secs(), m.len())))
+        .and_then(|m| {
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| (d.as_secs(), m.len()))
+        })
         .unwrap_or((0, 0));
     let mut paths_sorted = paths.clone();
     paths_sorted.sort();
     paths_sorted.dedup();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     expand.hash(&mut hasher);
-    for p in &paths_sorted { p.hash(&mut hasher); }
+    for p in &paths_sorted {
+        p.hash(&mut hasher);
+    }
     let req_sig = hasher.finish();
-    let cache_key = format!("{}|{}|{}|{}", base_abs.display(), sc_mtime, sc_size, req_sig);
+    let cache_key = format!(
+        "{}|{}|{}|{}",
+        base_abs.display(),
+        sc_mtime,
+        sc_size,
+        req_sig
+    );
     // Try cache
-    if let Some(hit) = { let cache = PATHS_INFO_CACHE.read().await; cache.get(&cache_key).cloned() } {
+    if let Some(hit) = {
+        let cache = PATHS_INFO_CACHE.read().await;
+        cache.get(&cache_key).cloned()
+    } {
         if Instant::now().duration_since(hit.at) < state.cache_ttl {
             return Ok(hit.items);
         }
@@ -632,11 +718,16 @@ async fn paths_info_response(state: &AppState, base_dir: &Path, req: AxRequest) 
                 let abs_target = normalize_join(&base_abs, norm_rel);
                 if abs_target.starts_with(&base_abs) || abs_target == base_abs {
                     if abs_target.is_dir() {
-                        results.push(json!({"path": norm_rel.replace('\\', "/"), "type": "directory"}));
+                        results.push(
+                            json!({"path": norm_rel.replace('\\', "/"), "type": "directory"}),
+                        );
                     } else if abs_target.is_file() {
                         let infos = collect_paths_info(&base_abs, Some(norm_rel)).await?;
                         for it in infos {
-                            if it["type"].as_str() == Some("file") { results.push(it); break; }
+                            if it["type"].as_str() == Some("file") {
+                                results.push(it);
+                                break;
+                            }
                         }
                     }
                 }
@@ -656,15 +747,28 @@ async fn paths_info_response(state: &AppState, base_dir: &Path, req: AxRequest) 
     let unique_clone = unique.clone();
     {
         let mut cache = PATHS_INFO_CACHE.write().await;
-        if cache.len() >= state.paths_info_cache_cap { if let Some(first_key) = cache.keys().next().cloned() { cache.remove(&first_key); } }
-        cache.insert(cache_key, PathsInfoEntry { items: unique_clone, at: Instant::now() });
+        if cache.len() >= state.paths_info_cache_cap {
+            if let Some(first_key) = cache.keys().next().cloned() {
+                cache.remove(&first_key);
+            }
+        }
+        cache.insert(
+            cache_key,
+            PathsInfoEntry {
+                items: unique_clone,
+                at: Instant::now(),
+            },
+        );
     }
     Ok(unique)
 }
 
 // (old POST sha256 removed; GET-only implemented in catchall)
 
-async fn collect_paths_info(base_dir: &Path, rel_prefix: Option<&str>) -> Result<Vec<Value>, Response> {
+async fn collect_paths_info(
+    base_dir: &Path,
+    rel_prefix: Option<&str>,
+) -> Result<Vec<Value>, Response> {
     let base_abs = dunce::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
     let mut results: Vec<Value> = Vec::new();
     let sidecar_map = get_sidecar_map(&base_abs).await.unwrap_or_default();
@@ -718,7 +822,9 @@ async fn collect_paths_info(base_dir: &Path, rel_prefix: Option<&str>) -> Result
                     continue;
                 }
                 if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name == ".paths-info.json" { continue; }
+                    if name == ".paths-info.json" {
+                        continue;
+                    }
                 }
                 let rel = pathdiff::diff_paths(&path, base_dir).unwrap_or(path.clone());
                 let rel_str = rel.to_string_lossy().to_string();
@@ -735,21 +841,27 @@ async fn collect_paths_info(base_dir: &Path, rel_prefix: Option<&str>) -> Result
             return Ok(results);
         }
         if abs_target.is_dir() {
-            if let Ok(mut v) = walk_dir_collect(&base_abs, &abs_target, norm_rel, &sidecar_map).await { results.append(&mut v); }
+            if let Ok(mut v) =
+                walk_dir_collect(&base_abs, &abs_target, norm_rel, &sidecar_map).await
+            {
+                results.append(&mut v);
+            }
         } else if abs_target.is_file() {
             results.push(build_file_entry(&abs_target, norm_rel, &sidecar_map));
         }
         return Ok(results);
     }
 
-    if let Ok(mut v) = walk_dir_collect(&base_abs, &base_abs, "", &sidecar_map).await { results.append(&mut v); }
+    if let Ok(mut v) = walk_dir_collect(&base_abs, &base_abs, "", &sidecar_map).await {
+        results.append(&mut v);
+    }
     Ok(results)
 }
 
 async fn get_sidecar_map(base_dir: &Path) -> io::Result<SidecarMap> {
     let sidecar = base_dir.join(".paths-info.json");
     if !sidecar.is_file() {
-        return Ok(HashMap::new());
+        return Ok(SidecarMap::new());
     }
     let md = sidecar.metadata()?;
     let size = md.len();
@@ -759,7 +871,11 @@ async fn get_sidecar_map(base_dir: &Path) -> io::Result<SidecarMap> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let key = (dunce::canonicalize(&sidecar).unwrap_or(sidecar.clone()), mtime, size);
+    let key = (
+        dunce::canonicalize(&sidecar).unwrap_or(sidecar.clone()),
+        mtime,
+        size,
+    );
     {
         let cache = SIDECAR_CACHE.read().await;
         if let Some(mp) = cache.inner.get(&key) {
@@ -768,7 +884,7 @@ async fn get_sidecar_map(base_dir: &Path) -> io::Result<SidecarMap> {
     }
     let data = fs::read_to_string(&sidecar).await?;
     let parsed: Value = serde_json::from_str(&data).unwrap_or(json!({}));
-    let mut map: SidecarMap = HashMap::new();
+    let mut map: SidecarMap = SidecarMap::new();
     if let Some(entries) = parsed.get("entries").and_then(|v| v.as_array()) {
         for it in entries {
             if it.get("type").and_then(|v| v.as_str()) == Some("file") {
@@ -802,8 +918,15 @@ async fn sha256_file_cached(state: &AppState, p: &Path) -> io::Result<String> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let key = (dunce::canonicalize(p).unwrap_or(p.to_path_buf()), mtime, size);
-    if let Some(hit) = { let cache = SHA256_CACHE.read().await; cache.get(&key).cloned() } {
+    let key = (
+        dunce::canonicalize(p).unwrap_or(p.to_path_buf()),
+        mtime,
+        size,
+    );
+    if let Some(hit) = {
+        let cache = SHA256_CACHE.read().await;
+        cache.get(&key).cloned()
+    } {
         if Instant::now().duration_since(hit.at) < state.cache_ttl {
             return Ok(hit.sum);
         }
@@ -813,26 +936,44 @@ async fn sha256_file_cached(state: &AppState, p: &Path) -> io::Result<String> {
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
         let n = file.read(&mut buf).await?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     let sum = hex::encode(hasher.finalize());
     {
         let mut cache = SHA256_CACHE.write().await;
         if cache.len() >= state.sha256_cache_cap {
-            if let Some(first_key) = cache.keys().next().cloned() { cache.remove(&first_key); }
+            if let Some(first_key) = cache.keys().next().cloned() {
+                cache.remove(&first_key);
+            }
         }
-        cache.insert(key, Sha256Entry { sum: sum.clone(), at: Instant::now() });
+        cache.insert(
+            key,
+            Sha256Entry {
+                sum: sum.clone(),
+                at: Instant::now(),
+            },
+        );
     }
     Ok(sum)
 }
 
 // ============ Resolve (GET/HEAD) ============
-async fn resolve_catchall(State(state): State<AppState>, AxPath(rest): AxPath<String>, req: AxRequest) -> impl IntoResponse {
+async fn resolve_catchall(
+    State(state): State<AppState>,
+    AxPath(rest): AxPath<String>,
+    req: AxRequest,
+) -> impl IntoResponse {
     // Two patterns supported:
     // - /{repo_id}/resolve/{revision}/{filename...} (GET|HEAD)
     // - /{repo_id}/sha256/{revision}/{filename...} (GET only)
-    let path = if rest.starts_with('/') { rest.clone() } else { format!("/{}", rest) };
+    let path = if rest.starts_with('/') {
+        rest.clone()
+    } else {
+        format!("/{}", rest)
+    };
 
     // First, handle /sha256/
     if let Some(idx) = path.rfind("/sha256/") {
@@ -847,9 +988,13 @@ async fn resolve_catchall(State(state): State<AppState>, AxPath(rest): AxPath<St
         if req.method() == Method::HEAD {
             return http_error(StatusCode::METHOD_NOT_ALLOWED, "Use GET for sha256");
         }
-        if filename == ".paths-info.json" { return http_not_found("File not found"); }
+        if filename == ".paths-info.json" {
+            return http_not_found("File not found");
+        }
         let filepath = state.root.join(left).join(filename);
-        if !filepath.is_file() { return http_not_found("File not found"); }
+        if !filepath.is_file() {
+            return http_not_found("File not found");
+        }
         match sha256_file_cached(&state, &filepath).await {
             Ok(sum) => {
                 let body = json!({ "sha256": sum });
@@ -863,7 +1008,9 @@ async fn resolve_catchall(State(state): State<AppState>, AxPath(rest): AxPath<St
     // Expect pattern: /{repo_id}/resolve/{revision}/{filename...}
     // We'll find the last occurrence of "/resolve/" and split.
     let needle = "/resolve/";
-    let Some(idx) = path.rfind(needle) else { return http_not_found("Not Found"); };
+    let Some(idx) = path.rfind(needle) else {
+        return http_not_found("Not Found");
+    };
     let left = &path[1..idx]; // skip leading '/'
     let right = &path[(idx + needle.len())..];
     // right = {revision}/{filename...}
@@ -904,7 +1051,10 @@ async fn resolve_catchall(State(state): State<AppState>, AxPath(rest): AxPath<St
             }
             RangeParse::Unsatisfiable => {
                 let mut headers = HeaderMap::new();
-                headers.insert("Content-Range", HeaderValue::from_str(&format!("bytes */{}", total)).unwrap());
+                headers.insert(
+                    "Content-Range",
+                    HeaderValue::from_str(&format!("bytes */{}", total)).unwrap(),
+                );
                 headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
                 return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
             }
@@ -928,17 +1078,35 @@ async fn resolve_catchall(State(state): State<AppState>, AxPath(rest): AxPath<St
                     }
                 };
                 let mut headers = HeaderMap::new();
-                headers.insert("Content-Range", HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, total)).unwrap());
+                headers.insert(
+                    "Content-Range",
+                    HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, total)).unwrap(),
+                );
                 headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-                headers.insert("Content-Length", HeaderValue::from_str(&length.to_string()).unwrap());
-                headers.insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
-                headers.insert("x-repo-commit", HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")));
-                headers.insert("x-revision", HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")));
+                headers.insert(
+                    "Content-Length",
+                    HeaderValue::from_str(&length.to_string()).unwrap(),
+                );
+                headers.insert(
+                    "Content-Type",
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+                headers.insert(
+                    "x-repo-commit",
+                    HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")),
+                );
+                headers.insert(
+                    "x-revision",
+                    HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")),
+                );
                 let body = Body::from_stream(stream);
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .body(body)
-                    .map(|mut r| { *r.headers_mut() = headers; r })
+                    .map(|mut r| {
+                        *r.headers_mut() = headers;
+                        r
+                    })
                     .unwrap()
                     .into_response();
             }
@@ -958,27 +1126,53 @@ async fn full_file_response(path: &Path, filename: Option<&str>) -> Response {
     let size = file.metadata().await.ok().map(|m| m.len()).unwrap_or(0);
     let stream = tokio_util::io::ReaderStream::with_capacity(file, CHUNK_SIZE);
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Length", HeaderValue::from_str(&size.to_string()).unwrap());
-    headers.insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
+    headers.insert(
+        "Content-Length",
+        HeaderValue::from_str(&size.to_string()).unwrap(),
+    );
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
     let body = Body::from_stream(stream);
     Response::builder()
         .status(StatusCode::OK)
         .body(body)
         .map(|mut r| {
-            for (k, v) in headers.iter() { r.headers_mut().insert(k, v.clone()); }
+            for (k, v) in headers.iter() {
+                r.headers_mut().insert(k, v.clone());
+            }
             r
         })
         .unwrap()
 }
 
-async fn head_file(state: &AppState, repo_id: &str, revision: &str, filename: &str, filepath: &Path) -> Response {
+async fn head_file(
+    state: &AppState,
+    repo_id: &str,
+    revision: &str,
+    filename: &str,
+    filepath: &Path,
+) -> Response {
     let size = file_size(filepath).unwrap_or(0);
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Length", HeaderValue::from_str(&size.to_string()).unwrap());
-    headers.insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
+    headers.insert(
+        "Content-Length",
+        HeaderValue::from_str(&size.to_string()).unwrap(),
+    );
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-    headers.insert("x-repo-commit", HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")));
-    headers.insert("x-revision", HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")));
+    headers.insert(
+        "x-repo-commit",
+        HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")),
+    );
+    headers.insert(
+        "x-revision",
+        HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")),
+    );
 
     // ETag strictly from sidecar; otherwise 500
     let repo_root = state.root.join(repo_id);
@@ -986,11 +1180,21 @@ async fn head_file(state: &AppState, repo_id: &str, revision: &str, filename: &s
     let sc_map = get_sidecar_map(&repo_root).await.unwrap_or_default();
     let mut etag: Option<String> = None;
     if let Some(sc) = sc_map.get(&rel_path) {
-        let ok_size = sc.get("size").and_then(|v| v.as_u64()).map(|s| s == size).unwrap_or(true);
+        let ok_size = sc
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .map(|s| s == size)
+            .unwrap_or(true);
         if ok_size {
-            if let Some(e) = sc.get("etag").and_then(|v| v.as_str()) { etag = Some(e.to_string()); }
-            else if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) { etag = Some(oid.to_string()); }
-            else if let Some(lfs_oid) = sc.get("lfs").and_then(|v| v.get("oid")).and_then(|v| v.as_str()) {
+            if let Some(e) = sc.get("etag").and_then(|v| v.as_str()) {
+                etag = Some(e.to_string());
+            } else if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {
+                etag = Some(oid.to_string());
+            } else if let Some(lfs_oid) = sc
+                .get("lfs")
+                .and_then(|v| v.get("oid"))
+                .and_then(|v| v.as_str())
+            {
                 etag = Some(lfs_oid.split(':').last().unwrap_or(lfs_oid).to_string());
             }
         }
@@ -1000,39 +1204,72 @@ async fn head_file(state: &AppState, repo_id: &str, revision: &str, filename: &s
         return http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available");
     }
     let quoted = format!("\"{}\"", etag.unwrap());
-    headers.insert("ETag", HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")));
+    headers.insert(
+        "ETag",
+        HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")),
+    );
     if filename.ends_with(".bin") {
-        headers.insert("x-lfs-size", HeaderValue::from_str(&size.to_string()).unwrap());
+        headers.insert(
+            "x-lfs-size",
+            HeaderValue::from_str(&size.to_string()).unwrap(),
+        );
     }
     (StatusCode::OK, headers).into_response()
 }
 
-enum RangeParse { Invalid, Unsatisfiable, Ok(u64, u64) }
+enum RangeParse {
+    Invalid,
+    Unsatisfiable,
+    Ok(u64, u64),
+}
 
 fn parse_range(h: &str, total: u64) -> RangeParse {
     let s = h.trim();
     let mut it = s.splitn(2, '=');
     let unit = it.next().unwrap_or("");
     let rest = it.next().unwrap_or("");
-    if unit.to_ascii_lowercase() != "bytes" { return RangeParse::Invalid; }
+    if unit.to_ascii_lowercase() != "bytes" {
+        return RangeParse::Invalid;
+    }
     let first = rest.split(',').next().unwrap_or("").trim();
-    if !first.contains('-') { return RangeParse::Invalid; }
+    if !first.contains('-') {
+        return RangeParse::Invalid;
+    }
     let mut ab = first.splitn(2, '-');
     let a = ab.next().unwrap_or("");
     let b = ab.next().unwrap_or("");
     if a.is_empty() {
         // suffix: bytes=-N
-        let Ok(n) = b.parse::<u64>() else { return RangeParse::Invalid; };
-        if n == 0 { return RangeParse::Invalid; }
+        let Ok(n) = b.parse::<u64>() else {
+            return RangeParse::Invalid;
+        };
+        if n == 0 {
+            return RangeParse::Invalid;
+        }
         let start = total.saturating_sub(n);
         let end = if total > 0 { total - 1 } else { 0 };
         return RangeParse::Ok(start, end);
     } else {
-        let Ok(mut start) = a.parse::<u64>() else { return RangeParse::Invalid; };
-        let mut end = if b.is_empty() { total.saturating_sub(1) } else { match b.parse::<u64>() { Ok(v) => v, Err(_) => return RangeParse::Invalid } };
-        if start >= total { return RangeParse::Unsatisfiable; }
-        if end >= total { end = total.saturating_sub(1); }
-        if end < start { return RangeParse::Unsatisfiable; }
+        let Ok(mut start) = a.parse::<u64>() else {
+            return RangeParse::Invalid;
+        };
+        let mut end = if b.is_empty() {
+            total.saturating_sub(1)
+        } else {
+            match b.parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => return RangeParse::Invalid,
+            }
+        };
+        if start >= total {
+            return RangeParse::Unsatisfiable;
+        }
+        if end >= total {
+            end = total.saturating_sub(1);
+        }
+        if end < start {
+            return RangeParse::Unsatisfiable;
+        }
         return RangeParse::Ok(start, end);
     }
 }
