@@ -1186,16 +1186,16 @@ async fn head_file(
             .map(|s| s == size)
             .unwrap_or(true);
         if ok_size {
-            if let Some(e) = sc.get("etag").and_then(|v| v.as_str()) {
-                etag = Some(e.to_string());
-            } else if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {
-                etag = Some(oid.to_string());
-            } else if let Some(lfs_oid) = sc
+            if let Some(lfs_oid) = sc
                 .get("lfs")
                 .and_then(|v| v.get("oid"))
                 .and_then(|v| v.as_str())
             {
                 etag = Some(lfs_oid.split(':').last().unwrap_or(lfs_oid).to_string());
+            } else if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {
+                etag = Some(oid.to_string());
+            } else if let Some(e) = sc.get("etag").and_then(|v| v.as_str()) {
+                etag = Some(e.to_string());
             }
         }
     }
@@ -1208,7 +1208,11 @@ async fn head_file(
         "ETag",
         HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")),
     );
-    if filename.ends_with(".bin") {
+    if sc_map
+        .get(&rel_path)
+        .and_then(|sc| sc.get("lfs"))
+        .is_some()
+    {
         headers.insert(
             "x-lfs-size",
             HeaderValue::from_str(&size.to_string()).unwrap(),

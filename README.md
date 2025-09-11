@@ -31,7 +31,7 @@ API（与 Python 版对齐）
 - 文件下载/探测
   - `GET|HEAD /{repo_id}/resolve/{revision}/{filename...}`
   - GET 支持 Range（bytes=...）：返回 206/416；非法 Range 回退 200 全量。
-  - HEAD：ETag 仅从 `.paths-info.json` 读取，不存在则 500；`.bin` 附带 `x-lfs-size`。
+  - HEAD：ETag 仅从 `.paths-info.json` 读取（LFS 文件用 `lfs.oid`，普通文件用 `oid`），不存在则 500；带 LFS 元数据的文件附带 `x-lfs-size`。
 - 新增：单文件 SHA-256
   - `GET /{repo_id}/sha256/{revision}/{filename...}`
   - 仅 GET；HEAD 返回 405。
@@ -56,3 +56,18 @@ paths-info 语义
   - paths-info 请求缓存：按 base 路径 + sidecar mtime/size + 请求签名；
   - sidecar 解析缓存：按文件路径 + mtime + size；
   - sha256 结果缓存：按文件路径 + mtime + size。
+
+生成本地仓库骨架
+------------------
+可使用二进制工具 `fetch_repo` 调用 HuggingFace 的 `paths-info` 接口，按真实元数据在 `fake_hub` 目录下生成目录结构与占位文件：
+
+```bash
+cargo run --bin fetch_repo -- user/repo
+```
+
+生成时会同时写入 `.paths-info.json` 侧车文件，供服务器在 HEAD 请求中读取 ETag。
+
+参数：
+- `--repo-type models|datasets`（默认 `models`）
+- `--revision`（默认 `main`）
+- `--dest` 目标根目录（默认 `fake_hub`）
