@@ -16,6 +16,7 @@ use std::time::Duration;
 struct TreeItem {
     path: String,
     lfs_oid: Option<String>,
+    size_bytes: Option<u64>,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -99,6 +100,10 @@ struct Opt {
     /// Content string to repeat when filling files (default: zeros)
     #[arg(long = "fill-content")]
     fill_content: Option<String>,
+
+    /// Fill files to metadata-recorded sizes when available
+    #[arg(long = "fill-from-metadata")]
+    fill_from_metadata: bool,
 
     /// Ignore system proxy settings for HTTP(S) requests
     #[arg(long = "no-proxy")]
@@ -215,15 +220,31 @@ fn fetch_repo_tree(
                     let tnorm = kind.to_ascii_lowercase();
                     if tnorm == "file" || tnorm == "blob" {
                         let mut lfs_oid = None;
+                        let mut size_bytes: Option<u64> = None;
                         if let Some(lfs) = obj.get("lfs").and_then(|v| v.as_object()) {
                             lfs_oid = lfs
                                 .get("oid")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
+                            if size_bytes.is_none() {
+                                if let Some(sz) = lfs.get("size").and_then(|v| v.as_i64()) {
+                                    if sz >= 0 {
+                                        size_bytes = Some(sz as u64);
+                                    }
+                                }
+                            }
+                        }
+                        if size_bytes.is_none() {
+                            if let Some(sz) = obj.get("size").and_then(|v| v.as_i64()) {
+                                if sz >= 0 {
+                                    size_bytes = Some(sz as u64);
+                                }
+                            }
                         }
                         out.push(TreeItem {
                             path: path.to_string(),
                             lfs_oid,
+                            size_bytes,
                         });
                     }
                 }
@@ -536,9 +557,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             16 * 1024 * 1024
         });
-        if let Some(ref s) = opt.fill_content {
-            fill_pattern = s.as_bytes().to_vec();
-        }
+    }
+    if let Some(ref s) = opt.fill_content {
+        // Allow custom fill content even when only --fill-from-metadata is used
+        fill_pattern = s.as_bytes().to_vec();
     }
 
     // Create files
@@ -556,7 +578,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             created_abs.push((abs, is_lfs));
             continue;
         }
-        if let Some(sz) = fill_size_bytes {
+        // Determine per-file size: prefer metadata when requested, else uniform fill-size
+        let mut chosen_size: Option<u64> = None;
+        if opt.fill_from_metadata {
+            if let Some(sz) = it.size_bytes { chosen_size = Some(sz); }
+        }
+        if chosen_size.is_none() {
+            chosen_size = fill_size_bytes;
+        }
+        if let Some(sz) = chosen_size {
             write_filled_file(&abs, sz, &fill_pattern, opt.force)?;
         } else {
             touch_empty_file(&abs, opt.force)?;
