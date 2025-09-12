@@ -85,6 +85,9 @@ cargo run --bin fetch_repo -- -t model user/repo
 - `--fill-size` 大小（例如 `16MiB`，若未指定则默认 16MiB）
 - `--fill-content` 重复内容字符串（默认 0 字节）
 - `--no-proxy` 忽略系统代理（默认遵循系统代理）
+ - 简单生成模式（无需访问网络）：
+   - `--gen-count <N>` 与 `--gen-avg-size <SIZE>`
+   - 在仓库根下生成 N 个扁平文件（`file_00001.bin`…），每个大小为 `<SIZE>`；支持 `--fill-content` 自定义填充字节模式。
 
 实现细节：
 - 通过 `GET /api/{models|datasets}/{repo}/tree/{rev}?recursive=1&expand=1` 获取文件列表；必要时携带 Bearer Token。
@@ -101,3 +104,8 @@ cargo run --bin fetch_repo -- -t model user/repo
   - `cargo run --bin fetch_repo -- tencent/HunyuanImage-2.1 --include 'vae/**' --fill --fill-size 1MiB --fill-content X`
 - 私有仓库或避免限流（使用 Token）：
   - `export HF_TOKEN=hf_xxx && cargo run --bin fetch_repo -- org/private-repo --token "$HF_TOKEN"`
+
+简单生成模式示例
+```bash
+cargo run --bin fetch_repo -- user/repo -t model --gen-count 100 --gen-avg-size 16MiB --fill-content X
+```

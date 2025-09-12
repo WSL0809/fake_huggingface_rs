@@ -19,6 +19,7 @@ struct TreeItem {
     size_bytes: Option<u64>,
 }
 
+
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum RepoTypeArg {
     Model,
@@ -108,6 +109,15 @@ struct Opt {
     /// Ignore system proxy settings for HTTP(S) requests
     #[arg(long = "no-proxy")]
     no_proxy: bool,
+
+
+    /// Generate N flat files under repo root (simple mode)
+    #[arg(long = "gen-count")]
+    gen_count: Option<usize>,
+
+    /// Average size for each generated file, e.g., 16MiB (simple mode)
+    #[arg(long = "gen-avg-size")]
+    gen_avg_size: Option<String>,
 }
 
 fn env_default_endpoint() -> String {
@@ -472,36 +482,63 @@ fn write_paths_info_sidecar(
 ) -> Result<Option<PathBuf>, String> {
     // Canonicalize root to ensure we can derive correct relative paths
     let root_abs = dunce::canonicalize(dst_root).map_err(|e| format!("canonicalize root: {e}"))?;
-    let mut entries: Vec<Value> = Vec::new();
+
+    // Collect file tasks
+    let mut tasks: Vec<(PathBuf, bool)> = Vec::new();
     for (abs_path, is_lfs) in created_paths {
         if abs_path.is_file() {
-            // Prefer robust diff over strip_prefix to handle mixed absolute/relative roots
-            let rel_path = pathdiff::diff_paths(abs_path, &root_abs).unwrap_or(abs_path.clone());
-            let rel = rel_path.to_string_lossy().replace('\\', "/");
-            let size = abs_path.metadata().map_err(|e| e.to_string())?.len();
-            let (sha1_hex, sha256_hex) = hash_file(abs_path)?;
-            let mut rec = serde_json::Map::new();
-            rec.insert("path".to_string(), json!(rel));
-            rec.insert("type".to_string(), json!("file"));
-            rec.insert("size".to_string(), json!(size as i64));
-            rec.insert("oid".to_string(), json!(sha1_hex));
-            if *is_lfs {
-                rec.insert(
-                    "lfs".to_string(),
-                    json!({"oid": format!("sha256:{}", sha256_hex), "size": (size as i64)}),
-                );
-            }
-            let rec = Value::Object(rec);
-            entries.push(rec);
+            tasks.push((abs_path.clone(), *is_lfs));
         }
     }
-    if entries.is_empty() {
+    if tasks.is_empty() {
         return Ok(None);
     }
+
     let sidecar_path = root_abs.join(".paths-info.json");
     if dry_run {
         return Ok(Some(sidecar_path));
     }
+
+    // Parallelize hashing across files. Keep memory bounded by per-thread 1MiB buffer in hash_file.
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let workers = std::cmp::max(1, std::cmp::min(threads, tasks.len()));
+    let chunk_size = (tasks.len() + workers - 1) / workers; // ceil div
+
+    let mut handles = Vec::with_capacity(workers);
+    for chunk in tasks.chunks(chunk_size) {
+        let chunk_vec: Vec<(PathBuf, bool)> = chunk.to_vec();
+        let root_clone = root_abs.clone();
+        handles.push(std::thread::spawn(move || -> Result<Vec<Value>, String> {
+            let mut out: Vec<Value> = Vec::with_capacity(chunk_vec.len());
+            for (abs_path, is_lfs) in chunk_vec {
+                // Prefer robust diff over strip_prefix to handle mixed absolute/relative roots
+                let rel_path = pathdiff::diff_paths(&abs_path, &root_clone).unwrap_or(abs_path.clone());
+                let rel = rel_path.to_string_lossy().replace('\\', "/");
+                let size = abs_path.metadata().map_err(|e| e.to_string())?.len();
+                let (sha1_hex, sha256_hex) = hash_file(&abs_path)?;
+                let mut rec = serde_json::Map::new();
+                rec.insert("path".to_string(), json!(rel));
+                rec.insert("type".to_string(), json!("file"));
+                rec.insert("size".to_string(), json!(size as i64));
+                rec.insert("oid".to_string(), json!(sha1_hex));
+                if is_lfs {
+                    rec.insert(
+                        "lfs".to_string(),
+                        json!({"oid": format!("sha256:{}", sha256_hex), "size": (size as i64)}),
+                    );
+                }
+                out.push(Value::Object(rec));
+            }
+            Ok(out)
+        }));
+    }
+
+    let mut entries: Vec<Value> = Vec::with_capacity(tasks.len());
+    for h in handles {
+        let part = h.join().map_err(|_| "join worker thread".to_string())??;
+        entries.extend(part);
+    }
+
     ensure_dir(&root_abs)?;
     let obj = json!({"version": 1, "entries": entries});
     let s = serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())?;
@@ -512,89 +549,77 @@ fn write_paths_info_sidecar(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
 
-    let endpoint = opt.endpoint.unwrap_or_else(env_default_endpoint);
-    let token = opt
-        .token
-        .or_else(|| std::env::var("HF_TOKEN").ok())
-        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
-        .or_else(|| std::env::var("HUGGINGFACEHUB_API_TOKEN").ok());
-
-    // Fetch remote tree
-    let items = match fetch_repo_tree(
-        &endpoint,
-        &opt.repo_id,
-        &opt.repo_type,
-        &opt.revision,
-        token.as_deref(),
-        opt.no_proxy,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return Ok(());
-        }
-    };
-
-    // Apply include/exclude/max-files filters
-    let mut filtered: Vec<&TreeItem> = items
-        .iter()
-        .filter(|ti| keep_by_filters(&ti.path, &opt.include, &opt.exclude))
-        .collect();
-    if let Some(m) = opt.max_files {
-        filtered.truncate(m);
-    }
-
-    // Destination root
+    // Destination root (same whether remote or spec-driven)
     let dst_root = dest_root(&opt.repo_type, &opt.repo_id, opt.dst.as_deref());
     ensure_dir(&dst_root).map_err(|e| format!("create root: {e}"))?;
 
-    // Resolve filler options
+    // Resolve filler options (used by both modes)
     let mut fill_size_bytes: Option<u64> = None;
     let mut fill_pattern: Vec<u8> = Vec::new();
     if opt.fill {
-        fill_size_bytes = Some(if let Some(ref s) = opt.fill_size {
-            parse_size(s)?
-        } else {
-            16 * 1024 * 1024
-        });
+        fill_size_bytes = Some(if let Some(ref s) = opt.fill_size { parse_size(s)? } else { 16 * 1024 * 1024 });
     }
     if let Some(ref s) = opt.fill_content {
-        // Allow custom fill content even when only --fill-from-metadata is used
         fill_pattern = s.as_bytes().to_vec();
     }
 
-    // Create files
     let mut created_abs: Vec<(PathBuf, bool)> = Vec::new();
-    for it in filtered {
-        let abs = match safe_join(&dst_root, &it.path) {
-            Ok(p) => p,
+
+    if opt.gen_count.is_some() || opt.gen_avg_size.is_some() {
+        // Simple synthetic mode: only count + average size
+        let count = match opt.gen_count { Some(c) if c > 0 => c, Some(_) => { eprintln!("Error: --gen-count must be > 0"); return Ok(()); }, None => { eprintln!("Error: --gen-count is required when using --gen-avg-size"); return Ok(()); } };
+        let avg_sz = match &opt.gen_avg_size { Some(s) => match parse_size(s) { Ok(v) => v, Err(e) => { eprintln!("Error: {e}"); return Ok(()); } }, None => { eprintln!("Error: --gen-avg-size is required with --gen-count"); return Ok(()); } };
+
+        for i in 1..=count {
+            let rel = format!("file_{:05}.bin", i);
+            let abs = match safe_join(&dst_root, &rel) { Ok(p) => p, Err(e) => { eprintln!("Warning: {e}"); continue; } };
+            if opt.dry_run { created_abs.push((abs, false)); continue; }
+            if let Err(e) = write_filled_file(&abs, avg_sz, &fill_pattern, opt.force) { eprintln!("Warning: write {}: {}", abs.display(), e); continue; }
+            created_abs.push((abs, false));
+        }
+    } else {
+        // Remote fetch mode (existing behavior)
+        let endpoint = opt.endpoint.unwrap_or_else(env_default_endpoint);
+        let token = opt
+            .token
+            .or_else(|| std::env::var("HF_TOKEN").ok())
+            .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+            .or_else(|| std::env::var("HUGGINGFACEHUB_API_TOKEN").ok());
+
+        let items = match fetch_repo_tree(
+            &endpoint,
+            &opt.repo_id,
+            &opt.repo_type,
+            &opt.revision,
+            token.as_deref(),
+            opt.no_proxy,
+        ) {
+            Ok(v) => v,
             Err(e) => {
-                eprintln!("Warning: {e}");
-                continue;
+                eprintln!("Error: {e}");
+                return Ok(());
             }
         };
-        let is_lfs = it.lfs_oid.is_some();
-        if opt.dry_run {
+
+        let mut filtered: Vec<&TreeItem> = items
+            .iter()
+            .filter(|ti| keep_by_filters(&ti.path, &opt.include, &opt.exclude))
+            .collect();
+        if let Some(m) = opt.max_files { filtered.truncate(m); }
+
+        for it in filtered {
+            let abs = match safe_join(&dst_root, &it.path) { Ok(p) => p, Err(e) => { eprintln!("Warning: {e}"); continue; } };
+            let is_lfs = it.lfs_oid.is_some();
+            if opt.dry_run { created_abs.push((abs, is_lfs)); continue; }
+            let mut chosen_size: Option<u64> = None;
+            if opt.fill_from_metadata { if let Some(sz) = it.size_bytes { chosen_size = Some(sz); } }
+            if chosen_size.is_none() { chosen_size = fill_size_bytes; }
+            if let Some(sz) = chosen_size { write_filled_file(&abs, sz, &fill_pattern, opt.force)?; } else { touch_empty_file(&abs, opt.force)?; }
             created_abs.push((abs, is_lfs));
-            continue;
         }
-        // Determine per-file size: prefer metadata when requested, else uniform fill-size
-        let mut chosen_size: Option<u64> = None;
-        if opt.fill_from_metadata {
-            if let Some(sz) = it.size_bytes { chosen_size = Some(sz); }
-        }
-        if chosen_size.is_none() {
-            chosen_size = fill_size_bytes;
-        }
-        if let Some(sz) = chosen_size {
-            write_filled_file(&abs, sz, &fill_pattern, opt.force)?;
-        } else {
-            touch_empty_file(&abs, opt.force)?;
-        }
-        created_abs.push((abs, is_lfs));
     }
 
-    // Write sidecar
+    // Write sidecar and summary (common)
     match write_paths_info_sidecar(&dst_root, &created_abs, opt.dry_run) {
         Ok(Some(sc)) => println!("Wrote sidecar: {}", sc.display()),
         Ok(None) => {}
@@ -604,11 +629,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Skeleton root: {}", dst_root.display());
     println!("Files: {}", created_abs.len());
     for (p, _) in &created_abs {
-        let rel = p
-            .strip_prefix(&dst_root)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .to_string();
+        let rel = p.strip_prefix(&dst_root).unwrap_or(p).to_string_lossy().to_string();
         println!("  {rel}");
     }
 
