@@ -27,6 +27,9 @@ sha1 = "0.10"
 percent-encoding = "2.3"
 glob = "0.3"
 
+[dev-dependencies]
+tower = "0.5"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

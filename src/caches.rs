@@ -42,5 +42,6 @@ pub struct Sha256Entry {
     pub at: Instant,
 }
 
-pub static SHA256_CACHE: once_cell::sync::Lazy<RwLock<HashMap<(PathBuf, u64, u64), Sha256Entry>>> =
+pub type Sha256Key = (PathBuf, u64, u64);
+pub static SHA256_CACHE: once_cell::sync::Lazy<RwLock<HashMap<Sha256Key, Sha256Entry>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));

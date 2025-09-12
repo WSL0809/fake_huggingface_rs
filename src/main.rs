@@ -24,12 +24,17 @@ use uuid::Uuid;
 
 mod app_state;
 mod caches;
+mod utils;
 
 use app_state::AppState;
 use caches::{
-    PATHS_INFO_CACHE, PathsInfoEntry, SHA256_CACHE, SIBLINGS_CACHE, SIDECAR_CACHE, Sha256Entry,
-    SiblingsEntry, SidecarMap,
+    PATHS_INFO_CACHE, PathsInfoEntry, SHA256_CACHE, SIBLINGS_CACHE, Sha256Entry, SiblingsEntry,
 };
+use utils::fs_walk::{collect_paths_info, list_siblings_except_sidecar};
+use utils::headers::{file_headers_common, set_content_range};
+use utils::paths::{file_size, is_sidecar_path, normalize_join_abs, secure_join};
+use utils::sidecar::{etag_from_sidecar, get_sidecar_map};
+use utils::repo_json::{build_repo_json, RepoJsonFlavor, RepoKind};
 
 const CHUNK_SIZE: usize = 262_144; // 256 KiB per read chunk
 
@@ -145,7 +150,7 @@ async fn log_requests_mw(
             let val = v.to_str().unwrap_or("");
             hdr_map.insert(
                 k.to_string(),
-                json!(redact_header(&k.to_string(), val, state.log_redact)),
+                json!(redact_header(k.as_str(), val, state.log_redact)),
             );
         }
     } else {
@@ -176,22 +181,32 @@ async fn log_requests_mw(
     let should_log_body =
         state.log_body_all || ct.to_ascii_lowercase().contains("application/json");
     if should_log_body {
-        let (parts, body) = req.into_parts();
-        // Use an effectively unlimited read limit so downstream still sees the full body.
-        // Only the logged snippet is truncated to log_body_max.
-        match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(bytes) => {
-                let slice_len = std::cmp::min(bytes.len(), state.log_body_max);
-                if slice_len > 0 {
-                    let s = String::from_utf8_lossy(&bytes[..slice_len]).to_string();
-                    body_snippet = if !s.is_empty() { Some(s) } else { None };
+        // Skip reading huge bodies based on Content-Length to avoid unbounded memory.
+        let cl_opt = headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok());
+        let hard_skip_threshold = state.log_body_max.saturating_mul(4);
+        if matches!(cl_opt, Some(cl) if cl > hard_skip_threshold) {
+            body_snippet = Some(format!(
+                "<skipped large body: content-length={}>",
+                cl_opt.unwrap()
+            ));
+        } else {
+            let (parts, body) = req.into_parts();
+            // Read full body to preserve downstream semantics, but log truncated snippet only.
+            match axum::body::to_bytes(body, usize::MAX).await {
+                Ok(bytes) => {
+                    let slice_len = std::cmp::min(bytes.len(), state.log_body_max);
+                    if slice_len > 0 {
+                        let s = String::from_utf8_lossy(&bytes[..slice_len]).to_string();
+                        body_snippet = if !s.is_empty() { Some(s) } else { None };
+                    }
+                    req = AxRequest::from_parts(parts, Body::from(bytes));
                 }
-                // Reassemble request with original full body bytes
-                req = AxRequest::from_parts(parts, Body::from(bytes));
-            }
-            Err(_) => {
-                // In rare errors, avoid panicking and pass an empty body downstream.
-                req = AxRequest::from_parts(parts, Body::empty());
+                Err(_) => {
+                    req = AxRequest::from_parts(parts, Body::empty());
+                }
             }
         }
     }
@@ -246,7 +261,7 @@ async fn log_requests_mw(
             let val = v.to_str().unwrap_or("");
             hdrs.insert(
                 k.to_string(),
-                json!(redact_header(&k.to_string(), val, state.log_redact)),
+                json!(redact_header(k.as_str(), val, state.log_redact)),
             );
         }
         info!(target: "fakehub", "[{}] Response headers: {}", req_id, serde_json::to_string(&hdrs).unwrap_or_default());
@@ -308,9 +323,11 @@ async fn get_model_paths_info_post(
     // expect "{repo_id}/paths-info/{revision}"
     let parts: Vec<&str> = rest.split('/').collect();
     if parts.len() >= 3 && parts[parts.len() - 2] == "paths-info" {
-        let revision = parts.last().unwrap_or(&"");
+        let _revision = parts.last().unwrap_or(&"");
         let repo_id = parts[..parts.len() - 2].join("/");
-        let repo_path = state.root.join(repo_id);
+        let Some(repo_path) = secure_join(&state.root, &repo_id) else {
+            return http_not_found("Repository not found");
+        };
         if !repo_path.is_dir() {
             return http_not_found("Repository not found");
         }
@@ -328,7 +345,9 @@ async fn build_model_response(
     repo_id: &str,
     revision: Option<&str>,
 ) -> Result<Value, Response> {
-    let repo_path = state.root.join(repo_id);
+    let Some(repo_path) = secure_join(&state.root, repo_id) else {
+        return Err(http_not_found("Repository not found"));
+    };
     if !repo_path.is_dir() {
         return Err(http_not_found("Repository not found"));
     }
@@ -345,81 +364,32 @@ async fn build_model_response(
         cache.get(&cache_key).cloned()
     } {
         if now.duration_since(hit.at) < state.cache_ttl {
-            let fake_sha = revision
-                .map(|r| format!("fakesha-{}", r))
-                .unwrap_or_else(|| "fakesha1234567890".to_string());
-            let val = json!({
-                "_id": format!("local/{}", repo_id),
-                "id": repo_id,
-                "private": false,
-                "pipeline_tag": "text-generation",
-                "library_name": "transformers",
-                "tags": ["transformers", "gpt2", "text-generation"],
-                "downloads": 0,
-                "likes": 0,
-                "modelId": repo_id,
-                "author": "local-user",
-                "sha": fake_sha,
-                "lastModified": "1970-01-01T00:00:00.000Z",
-                "createdAt": "1970-01-01T00:00:00.000Z",
-                "gated": false,
-                "disabled": false,
-                "widgetData": [{"text": "Hello"}],
-                "model-index": Value::Null,
-                "config": {"architectures": ["GPT2LMHeadModel"], "model_type": "gpt2", "tokenizer_config": {}},
-                "cardData": {"language": "en", "tags": ["example"], "license": "mit"},
-                "transformersInfo": {
-                    "auto_model": "AutoModelForCausalLM",
-                    "pipeline_tag": "text-generation",
-                    "processor": "AutoTokenizer",
-                },
-                "safetensors": {"parameters": {"F32": 0}, "total": 0},
-                "siblings": hit.siblings,
-                "spaces": [],
-                "usedStorage": (hit.total as i64),
-            });
+            let val = build_repo_json(
+                RepoKind::Model,
+                repo_id,
+                revision,
+                &hit.siblings,
+                hit.total,
+                RepoJsonFlavor::Rich,
+            );
             return Ok(val);
         }
     }
 
     // Miss or expired: compute
-    let mut siblings: Vec<Value> = Vec::new();
-    let mut total_size: u64 = 0;
-    let mut dirs = vec![repo_path.clone()];
-    while let Some(dir) = dirs.pop() {
-        if let Ok(mut rd) = fs::read_dir(&dir).await {
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let path = ent.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                    continue;
-                }
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name == ".paths-info.json" {
-                        continue;
-                    }
-                }
-                let rel = pathdiff::diff_paths(&path, &repo_path).unwrap_or(path.clone());
-                let rel_norm = rel.to_string_lossy().replace('\\', "/");
-                siblings.push(json!({"rfilename": rel_norm}));
-                if let Ok(md) = ent.metadata().await {
-                    total_size = total_size.saturating_add(md.len());
-                }
-            }
-        }
-    }
-    siblings.sort_by(|a, b| {
-        a["rfilename"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["rfilename"].as_str().unwrap_or(""))
-    });
+    let (siblings, total_size): (Vec<Value>, u64) =
+        list_siblings_except_sidecar(&repo_path).await.unwrap_or_default();
     // Insert to cache (bounded)
     {
         let mut cache = SIBLINGS_CACHE.write().await;
         if cache.len() >= state.siblings_cache_cap {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
+            // Remove the oldest entry for predictability
+            if let Some((oldest_key, _)) = cache
+                .iter()
+                .min_by_key(|(_, v)| v.at)
+                .map(|(k, v)| (k.clone(), v.at))
+            {
+                cache.remove(&oldest_key);
             }
         }
         cache.insert(
@@ -432,40 +402,14 @@ async fn build_model_response(
         );
     }
 
-    let fake_sha = revision
-        .map(|r| format!("fakesha-{}", r))
-        .unwrap_or_else(|| "fakesha1234567890".to_string());
-
-    let val = json!({
-        "_id": format!("local/{}", repo_id),
-        "id": repo_id,
-        "private": false,
-        // "pipeline_tag": "text-generation",
-        // "library_name": "transformers",
-        // "tags": ["transformers", "gpt2", "text-generation"],
-        // "downloads": 0,
-        // "likes": 0,
-        "modelId": repo_id,
-        // "author": "local-user",
-        "sha": fake_sha,
-        // "lastModified": "1970-01-01T00:00:00.000Z",
-        // "createdAt": "1970-01-01T00:00:00.000Z",
-        // "gated": false,
-        // "disabled": false,
-        // "widgetData": [{"text": "Hello"}],
-        "model-index": Value::Null,
-        // "config": {"architectures": ["GPT2LMHeadModel"], "model_type": "gpt2", "tokenizer_config": {}},
-        // "cardData": {"language": "en", "tags": ["example"], "license": "mit"},
-        // "transformersInfo": {
-        //     "auto_model": "AutoModelForCausalLM",
-        //     "pipeline_tag": "text-generation",
-        //     "processor": "AutoTokenizer",
-        // },
-        // "safetensors": {"parameters": {"F32": 0}, "total": 0},
-        "siblings": siblings,
-        // "spaces": [],
-        "usedStorage": (total_size as i64),
-    });
+    let val = build_repo_json(
+        RepoKind::Model,
+        repo_id,
+        revision,
+        &siblings,
+        total_size,
+        RepoJsonFlavor::Minimal,
+    );
     Ok(val)
 }
 
@@ -502,7 +446,10 @@ async fn get_dataset_paths_info_post(
     if parts.len() >= 3 && parts[parts.len() - 2] == "paths-info" {
         let _revision = parts.last().unwrap_or(&"");
         let repo_id = parts[..parts.len() - 2].join("/");
-        let ds_path = state.root.join("datasets").join(repo_id);
+        let ds_base = state.root.join("datasets");
+        let Some(ds_path) = secure_join(&ds_base, &repo_id) else {
+            return http_not_found("Dataset not found");
+        };
         if !ds_path.is_dir() {
             return http_not_found("Dataset not found");
         }
@@ -520,7 +467,10 @@ async fn build_dataset_response(
     repo_id: &str,
     revision: Option<&str>,
 ) -> Result<Value, Response> {
-    let ds_path = state.root.join("datasets").join(repo_id);
+    let ds_base = state.root.join("datasets");
+    let Some(ds_path) = secure_join(&ds_base, repo_id) else {
+        return Err(http_not_found("Dataset not found"));
+    };
     if !ds_path.is_dir() {
         return Err(http_not_found("Dataset not found"));
     }
@@ -536,66 +486,29 @@ async fn build_dataset_response(
         cache.get(&cache_key).cloned()
     } {
         if now.duration_since(hit.at) < state.cache_ttl {
-            let fake_sha = revision
-                .map(|r| format!("fakesha-{}", r))
-                .unwrap_or_else(|| "fakesha1234567890".to_string());
-            let val = json!({
-                "_id": format!("local/datasets/{}", repo_id),
-                "id": repo_id,
-                "private": false,
-                "tags": ["dataset"],
-                // "downloads": 0,
-                // "likes": 0,
-                // "author": "local-user",
-                "sha": fake_sha,
-                // "lastModified": "1970-01-01T00:00:00.000Z",
-                // "createdAt": "1970-01-01T00:00:00.000Z",
-                // "gated": false,
-                // "disabled": false,
-                // "cardData": {"license": "mit", "language": ["en"]},
-                "siblings": hit.siblings,
-                "usedStorage": (hit.total as i64),
-            });
+            let val = build_repo_json(
+                RepoKind::Dataset,
+                repo_id,
+                revision,
+                &hit.siblings,
+                hit.total,
+                RepoJsonFlavor::Minimal,
+            );
             return Ok(val);
         }
     }
 
-    let mut siblings: Vec<Value> = Vec::new();
-    let mut total_size: u64 = 0;
-    let mut dirs = vec![ds_path.clone()];
-    while let Some(dir) = dirs.pop() {
-        if let Ok(mut rd) = fs::read_dir(&dir).await {
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let path = ent.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                    continue;
-                }
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name == ".paths-info.json" {
-                        continue;
-                    }
-                }
-                let rel = pathdiff::diff_paths(&path, &ds_path).unwrap_or(path.clone());
-                let rel_norm = rel.to_string_lossy().replace('\\', "/");
-                siblings.push(json!({"rfilename": rel_norm}));
-                if let Ok(md) = ent.metadata().await {
-                    total_size = total_size.saturating_add(md.len());
-                }
-            }
-        }
-    }
-    siblings.sort_by(|a, b| {
-        a["rfilename"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["rfilename"].as_str().unwrap_or(""))
-    });
+    let (siblings, total_size): (Vec<Value>, u64) =
+        list_siblings_except_sidecar(&ds_path).await.unwrap_or_default();
     {
         let mut cache = SIBLINGS_CACHE.write().await;
         if cache.len() >= state.siblings_cache_cap {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
+            if let Some((oldest_key, _)) = cache
+                .iter()
+                .min_by_key(|(_, v)| v.at)
+                .map(|(k, v)| (k.clone(), v.at))
+            {
+                cache.remove(&oldest_key);
             }
         }
         cache.insert(
@@ -608,27 +521,14 @@ async fn build_dataset_response(
         );
     }
 
-    let fake_sha = revision
-        .map(|r| format!("fakesha-{}", r))
-        .unwrap_or_else(|| "fakesha1234567890".to_string());
-
-    let val = json!({
-        "_id": format!("local/datasets/{}", repo_id),
-        "id": repo_id,
-        "private": false,
-        "tags": ["dataset"],
-        "downloads": 0,
-        "likes": 0,
-        "author": "local-user",
-        "sha": fake_sha,
-        "lastModified": "1970-01-01T00:00:00.000Z",
-        "createdAt": "1970-01-01T00:00:00.000Z",
-        "gated": false,
-        "disabled": false,
-        "cardData": {"license": "mit", "language": ["en"]},
-        "siblings": siblings,
-        "usedStorage": (total_size as i64),
-    });
+    let val = build_repo_json(
+        RepoKind::Dataset,
+        repo_id,
+        revision,
+        &siblings,
+        total_size,
+        RepoJsonFlavor::Rich,
+    );
     Ok(val)
 }
 
@@ -722,7 +622,7 @@ async fn paths_info_response(
                 results.extend(collect_paths_info(&base_abs, Some(trimmed)).await?);
             } else {
                 let norm_rel = trimmed.trim_start_matches('/');
-                let abs_target = normalize_join(&base_abs, norm_rel);
+                let abs_target = normalize_join_abs(&base_abs, norm_rel);
                 if abs_target.starts_with(&base_abs) || abs_target == base_abs {
                     if abs_target.is_dir() {
                         results.push(
@@ -755,8 +655,12 @@ async fn paths_info_response(
     {
         let mut cache = PATHS_INFO_CACHE.write().await;
         if cache.len() >= state.paths_info_cache_cap {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
+            if let Some((oldest_key, _)) = cache
+                .iter()
+                .min_by_key(|(_, v)| v.at)
+                .map(|(k, v)| (k.clone(), v.at))
+            {
+                cache.remove(&oldest_key);
             }
         }
         cache.insert(
@@ -772,148 +676,7 @@ async fn paths_info_response(
 
 // (old POST sha256 removed; GET-only implemented in catchall)
 
-async fn collect_paths_info(
-    base_dir: &Path,
-    rel_prefix: Option<&str>,
-) -> Result<Vec<Value>, Response> {
-    let base_abs = dunce::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
-    let mut results: Vec<Value> = Vec::new();
-    let sidecar_map = get_sidecar_map(&base_abs).await.unwrap_or_default();
-
-    fn build_file_entry(abs_path: &Path, rel_path: &str, sidecar_map: &SidecarMap) -> Value {
-        let rel_norm = rel_path.replace('\\', "/");
-        if let Some(sc) = sidecar_map.get(&rel_norm) {
-            let mut rec = serde_json::Map::new();
-            rec.insert("path".to_string(), json!(rel_norm));
-            rec.insert("type".to_string(), json!("file"));
-            let size = file_size(abs_path).unwrap_or(0);
-            rec.insert("size".to_string(), json!(size as i64));
-            if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {
-                rec.insert("oid".to_string(), json!(oid));
-            }
-            if let Some(lfs) = sc.get("lfs").and_then(|v| v.as_object()) {
-                let mut ldict = serde_json::Map::new();
-                if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) {
-                    ldict.insert("oid".to_string(), json!(loid));
-                }
-                ldict.insert("size".to_string(), json!(size as i64));
-                rec.insert("lfs".to_string(), Value::Object(ldict));
-            }
-            return Value::Object(rec);
-        }
-        let size = file_size(abs_path).unwrap_or(0);
-        json!({
-            "path": rel_norm,
-            "type": "file",
-            "size": (size as i64),
-        })
-    }
-
-    async fn walk_dir_collect(
-        base_dir: &Path,
-        start_abs: &Path,
-        start_rel: &str,
-        sidecar_map: &SidecarMap,
-    ) -> io::Result<Vec<Value>> {
-        let mut out: Vec<Value> = Vec::new();
-        if !start_rel.is_empty() {
-            out.push(json!({"path": start_rel.replace('\\', "/"), "type": "directory"}));
-        }
-        let mut stack = vec![start_abs.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let mut rd = fs::read_dir(&dir).await?;
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let path = ent.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name == ".paths-info.json" {
-                        continue;
-                    }
-                }
-                let rel = pathdiff::diff_paths(&path, base_dir).unwrap_or(path.clone());
-                let rel_str = rel.to_string_lossy().to_string();
-                out.push(build_file_entry(&path, &rel_str, sidecar_map));
-            }
-        }
-        Ok(out)
-    }
-
-    if let Some(prefix) = rel_prefix {
-        let norm_rel = prefix.trim().trim_start_matches('/');
-        let abs_target = normalize_join(&base_abs, norm_rel);
-        if !(abs_target.starts_with(&base_abs) || abs_target == base_abs) {
-            return Ok(results);
-        }
-        if abs_target.is_dir() {
-            if let Ok(mut v) =
-                walk_dir_collect(&base_abs, &abs_target, norm_rel, &sidecar_map).await
-            {
-                results.append(&mut v);
-            }
-        } else if abs_target.is_file() {
-            results.push(build_file_entry(&abs_target, norm_rel, &sidecar_map));
-        }
-        return Ok(results);
-    }
-
-    if let Ok(mut v) = walk_dir_collect(&base_abs, &base_abs, "", &sidecar_map).await {
-        results.append(&mut v);
-    }
-    Ok(results)
-}
-
-async fn get_sidecar_map(base_dir: &Path) -> io::Result<SidecarMap> {
-    let sidecar = base_dir.join(".paths-info.json");
-    if !sidecar.is_file() {
-        return Ok(SidecarMap::new());
-    }
-    let md = sidecar.metadata()?;
-    let size = md.len();
-    let mtime = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let key = (
-        dunce::canonicalize(&sidecar).unwrap_or(sidecar.clone()),
-        mtime,
-        size,
-    );
-    {
-        let cache = SIDECAR_CACHE.read().await;
-        if let Some(mp) = cache.inner.get(&key) {
-            return Ok(mp.clone());
-        }
-    }
-    let data = fs::read_to_string(&sidecar).await?;
-    let parsed: Value = serde_json::from_str(&data).unwrap_or(json!({}));
-    let mut map: SidecarMap = SidecarMap::new();
-    if let Some(entries) = parsed.get("entries").and_then(|v| v.as_array()) {
-        for it in entries {
-            if it.get("type").and_then(|v| v.as_str()) == Some("file") {
-                if let Some(path) = it.get("path").and_then(|v| v.as_str()) {
-                    map.insert(path.to_string(), it.clone());
-                }
-            }
-        }
-    }
-    let mut cache = SIDECAR_CACHE.write().await;
-    cache.inner.insert(key, map.clone());
-    Ok(map)
-}
-
-fn file_size(p: &Path) -> io::Result<u64> {
-    Ok(p.metadata()?.len())
-}
-
-fn normalize_join(base: &Path, rel: &str) -> PathBuf {
-    let joined = base.join(rel);
-    dunce::canonicalize(&joined).unwrap_or(joined)
-}
+// collect_paths_info moved to utils::fs_walk
 
 // Compute sha256 with TTL cache keyed by (path, mtime, size)
 async fn sha256_file_cached(state: &AppState, p: &Path) -> io::Result<String> {
@@ -952,8 +715,12 @@ async fn sha256_file_cached(state: &AppState, p: &Path) -> io::Result<String> {
     {
         let mut cache = SHA256_CACHE.write().await;
         if cache.len() >= state.sha256_cache_cap {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
+            if let Some((oldest_key, _)) = cache
+                .iter()
+                .min_by_key(|(_, v)| v.at)
+                .map(|(k, v)| (k.clone(), v.at))
+            {
+                cache.remove(&oldest_key);
             }
         }
         cache.insert(
@@ -979,7 +746,7 @@ async fn resolve_catchall(
     let path = if rest.starts_with('/') {
         rest.clone()
     } else {
-        format!("/{}", rest)
+        format!("/{rest}")
     };
 
     // First, handle /sha256/
@@ -995,10 +762,13 @@ async fn resolve_catchall(
         if req.method() == Method::HEAD {
             return http_error(StatusCode::METHOD_NOT_ALLOWED, "Use GET for sha256");
         }
-        if filename == ".paths-info.json" {
+        if is_sidecar_path(filename) {
             return http_not_found("File not found");
         }
-        let filepath = state.root.join(left).join(filename);
+        let rel = format!("{}/{}", left.trim_start_matches('/'), filename);
+        let Some(filepath) = secure_join(&state.root, &rel) else {
+            return http_not_found("File not found");
+        };
         if !filepath.is_file() {
             return http_not_found("File not found");
         }
@@ -1029,11 +799,14 @@ async fn resolve_catchall(
     }
 
     // .paths-info.json cannot be served as file
-    if filename == ".paths-info.json" {
+    if is_sidecar_path(filename) {
         return http_not_found("File not found");
     }
 
-    let filepath = state.root.join(left).join(filename);
+    let rel = format!("{}/{}", left.trim_start_matches('/'), filename);
+    let Some(filepath) = secure_join(&state.root, &rel) else {
+        return http_not_found("File not found");
+    };
     if !filepath.is_file() {
         return http_not_found("File not found");
     }
@@ -1054,13 +827,13 @@ async fn resolve_catchall(
         match parse_range(&rh, total) {
             RangeParse::Invalid => {
                 // ignore range, return full file
-                return full_file_response(&filepath, None).await;
+                return full_file_response(&state, left, revision, filename, &filepath).await;
             }
             RangeParse::Unsatisfiable => {
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     "Content-Range",
-                    HeaderValue::from_str(&format!("bytes */{}", total)).unwrap(),
+                    HeaderValue::from_str(&format!("bytes */{total}")).unwrap(),
                 );
                 headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
                 return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
@@ -1068,8 +841,8 @@ async fn resolve_catchall(
             RangeParse::Ok(start, end) => {
                 let length = end - start + 1;
                 let stream = stream! {
-                    let mut f = match fs::File::open(&filepath).await { Ok(f) => f, Err(e) => { error!("open file: {}", e); yield Err(io::Error::new(io::ErrorKind::Other, "open failed")); return; } };
-                    if let Err(e) = f.seek(std::io::SeekFrom::Start(start)).await { error!("seek: {}", e); yield Err(io::Error::new(io::ErrorKind::Other, "seek failed")); return; }
+                    let mut f = match fs::File::open(&filepath).await { Ok(f) => f, Err(e) => { error!("open file: {}", e); yield Err(io::Error::other("open failed")); return; } };
+                    if let Err(e) = f.seek(std::io::SeekFrom::Start(start)).await { error!("seek: {}", e); yield Err(io::Error::other("seek failed")); return; }
                     let mut remaining = length as usize;
                     let mut buf = vec![0u8; CHUNK_SIZE];
                     while remaining > 0 {
@@ -1084,28 +857,8 @@ async fn resolve_catchall(
                         }
                     }
                 };
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    "Content-Range",
-                    HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, total)).unwrap(),
-                );
-                headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-                headers.insert(
-                    "Content-Length",
-                    HeaderValue::from_str(&length.to_string()).unwrap(),
-                );
-                headers.insert(
-                    "Content-Type",
-                    HeaderValue::from_static("application/octet-stream"),
-                );
-                headers.insert(
-                    "x-repo-commit",
-                    HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")),
-                );
-                headers.insert(
-                    "x-revision",
-                    HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")),
-                );
+                let mut headers = file_headers_common(revision, length);
+                set_content_range(&mut headers, start, end, total);
                 let body = Body::from_stream(stream);
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
@@ -1120,10 +873,16 @@ async fn resolve_catchall(
         }
     }
 
-    full_file_response(&filepath, None).await
+    full_file_response(&state, left, revision, filename, &filepath).await
 }
 
-async fn full_file_response(path: &Path, _filename: Option<&str>) -> Response {
+async fn full_file_response(
+    state: &AppState,
+    repo_id: &str,
+    revision: &str,
+    filename: &str,
+    path: &Path,
+) -> Response {
     // Read entire file into body stream using tokio_util::io::ReaderStream if desired.
     // For simplicity and parity, we use a streaming reader.
     let file = match fs::File::open(path).await {
@@ -1132,15 +891,27 @@ async fn full_file_response(path: &Path, _filename: Option<&str>) -> Response {
     };
     let size = file.metadata().await.ok().map(|m| m.len()).unwrap_or(0);
     let stream = tokio_util::io::ReaderStream::with_capacity(file, CHUNK_SIZE);
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "Content-Length",
-        HeaderValue::from_str(&size.to_string()).unwrap(),
-    );
-    headers.insert(
-        "Content-Type",
-        HeaderValue::from_static("application/octet-stream"),
-    );
+    let mut headers = file_headers_common(revision, size);
+    // Best-effort ETag for GET: add if available in sidecar; otherwise omit (do not break userspace)
+    if let Some(repo_root) = secure_join(&state.root, repo_id) {
+        if let Ok(sc_map) = get_sidecar_map(&repo_root).await {
+            let rel_path = filename.replace('\\', "/");
+            if let Some((etag, is_lfs)) = etag_from_sidecar(&sc_map, &rel_path, size) {
+                let quoted = format!("\"{etag}\"");
+                headers.insert(
+                    "ETag",
+                    HeaderValue::from_str(&quoted)
+                        .unwrap_or(HeaderValue::from_static("\"-\"")),
+                );
+                if is_lfs {
+                    headers.insert(
+                        "x-lfs-size",
+                        HeaderValue::from_str(&size.to_string()).unwrap(),
+                    );
+                }
+            }
+        }
+    }
     let body = Body::from_stream(stream);
     Response::builder()
         .status(StatusCode::OK)
@@ -1162,64 +933,26 @@ async fn head_file(
     filepath: &Path,
 ) -> Response {
     let size = file_size(filepath).unwrap_or(0);
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "Content-Length",
-        HeaderValue::from_str(&size.to_string()).unwrap(),
-    );
-    headers.insert(
-        "Content-Type",
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-    headers.insert(
-        "x-repo-commit",
-        HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")),
-    );
-    headers.insert(
-        "x-revision",
-        HeaderValue::from_str(revision).unwrap_or(HeaderValue::from_static("-")),
-    );
+    let mut headers = file_headers_common(revision, size);
 
     // ETag strictly from sidecar; otherwise 500
-    let repo_root = state.root.join(repo_id);
+    let Some(repo_root) = secure_join(&state.root, repo_id) else {
+        return http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available");
+    };
     let rel_path = filename.replace('\\', "/");
     let sc_map = get_sidecar_map(&repo_root).await.unwrap_or_default();
-    let mut etag: Option<String> = None;
-    if let Some(sc) = sc_map.get(&rel_path) {
-        let ok_size = sc
-            .get("size")
-            .and_then(|v| v.as_u64())
-            .map(|s| s == size)
-            .unwrap_or(true);
-        if ok_size {
-            if let Some(lfs_oid) = sc
-                .get("lfs")
-                .and_then(|v| v.get("oid"))
-                .and_then(|v| v.as_str())
-            {
-                etag = Some(lfs_oid.split(':').last().unwrap_or(lfs_oid).to_string());
-            } else if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {
-                etag = Some(oid.to_string());
-            } else if let Some(e) = sc.get("etag").and_then(|v| v.as_str()) {
-                etag = Some(e.to_string());
-            }
-        }
-    }
-    if etag.is_none() {
+    let etag_pair = etag_from_sidecar(&sc_map, &rel_path, size);
+    if etag_pair.is_none() {
         error!("ETag missing for {}@{}:{}", repo_id, revision, rel_path);
         return http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available");
     }
-    let quoted = format!("\"{}\"", etag.unwrap());
+    let (etag, is_lfs) = etag_pair.unwrap();
+    let quoted = format!("\"{etag}\"");
     headers.insert(
         "ETag",
         HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")),
     );
-    if sc_map
-        .get(&rel_path)
-        .and_then(|sc| sc.get("lfs"))
-        .is_some()
-    {
+    if is_lfs {
         headers.insert(
             "x-lfs-size",
             HeaderValue::from_str(&size.to_string()).unwrap(),
@@ -1239,7 +972,7 @@ fn parse_range(h: &str, total: u64) -> RangeParse {
     let mut it = s.splitn(2, '=');
     let unit = it.next().unwrap_or("");
     let rest = it.next().unwrap_or("");
-    if unit.to_ascii_lowercase() != "bytes" {
+    if !unit.eq_ignore_ascii_case("bytes") {
         return RangeParse::Invalid;
     }
     let first = rest.split(',').next().unwrap_or("").trim();
@@ -1259,7 +992,7 @@ fn parse_range(h: &str, total: u64) -> RangeParse {
         }
         let start = total.saturating_sub(n);
         let end = if total > 0 { total - 1 } else { 0 };
-        return RangeParse::Ok(start, end);
+        RangeParse::Ok(start, end)
     } else {
         let Ok(start) = a.parse::<u64>() else {
             return RangeParse::Invalid;
@@ -1281,7 +1014,7 @@ fn parse_range(h: &str, total: u64) -> RangeParse {
         if end < start {
             return RangeParse::Unsatisfiable;
         }
-        return RangeParse::Ok(start, end);
+        RangeParse::Ok(start, end)
     }
 }
 
@@ -1294,4 +1027,96 @@ fn http_not_found(msg: &str) -> Response {
 fn http_error(status: StatusCode, msg: &str) -> Response {
     let body = json!({"detail": msg});
     (status, Json(body)).into_response()
+}
+
+// helpers moved to utils::{paths,sidecar,fs_walk}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range;
+    use super::*;
+    use axum::routing::get;
+    use axum::Router;
+    use std::sync::Arc;
+    use tower::util::ServiceExt;
+
+    #[test]
+    fn parse_range_happy_paths() {
+        use super::RangeParse;
+        assert!(matches!(parse_range("bytes=0-0", 10), RangeParse::Ok(0, 0)));
+        assert!(matches!(parse_range("bytes=5-9", 10), RangeParse::Ok(5, 9)));
+        assert!(matches!(parse_range("bytes=5-", 10), RangeParse::Ok(5, 9)));
+        assert!(matches!(parse_range("bytes=-3", 10), RangeParse::Ok(7, 9)));
+    }
+
+    #[test]
+    fn parse_range_bad_cases() {
+        use super::RangeParse;
+        assert!(matches!(parse_range("bits=0-1", 10), RangeParse::Invalid));
+        assert!(matches!(parse_range("bytes=10-10", 10), RangeParse::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=0-1000", 100), RangeParse::Ok(0, 99)));
+    }
+
+    #[tokio::test]
+    async fn router_head_get_with_etag() {
+        // Arrange a tiny repo under fake_hub/tests_repo_etag
+        let root = dunce::canonicalize("fake_hub").unwrap_or_else(|_| std::path::PathBuf::from("fake_hub"));
+        let repo_id = "tests_repo_etag";
+        let repo_dir = root.join(repo_id);
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
+        let file_path = repo_dir.join("x.bin");
+        tokio::fs::write(&file_path, b"hello").await.unwrap();
+        let size = file_path.metadata().unwrap().len();
+        let sidecar = repo_dir.join(".paths-info.json");
+        let sc = serde_json::json!({
+            "entries": [{
+                "path": "x.bin", "type": "file", "size": size as i64,
+                "lfs": {"oid": "sha256:1234", "size": size as i64}
+            }]
+        });
+        tokio::fs::write(&sidecar, serde_json::to_vec(&sc).unwrap()).await.unwrap();
+
+        // Build router with only resolve route
+        let state = AppState {
+            root: Arc::new(root.clone()),
+            log_requests: false,
+            log_body_max: 1024,
+            log_headers_mode_all: false,
+            log_resp_headers: false,
+            log_redact: true,
+            log_body_all: false,
+            cache_ttl: std::time::Duration::from_millis(2000),
+            paths_info_cache_cap: 64,
+            siblings_cache_cap: 64,
+            sha256_cache_cap: 64,
+        };
+        let app = Router::new()
+            .route("/{*rest}", get(resolve_catchall).head(resolve_catchall))
+            .with_state(state);
+
+        // HEAD should return ETag from sidecar (1234)
+        let uri = format!("/{repo_id}/resolve/main/x.bin");
+        let resp = app
+            .clone()
+            .oneshot(axum::http::Request::builder().method("HEAD").uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp.headers().get("ETag").unwrap().to_str().unwrap();
+        assert_eq!(etag, "\"1234\"");
+        assert!(resp.headers().get("Accept-Ranges").is_some());
+
+        // GET with range
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("Range", "bytes=0-1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let cr = resp.headers().get("Content-Range").unwrap().to_str().unwrap();
+        assert!(cr.starts_with("bytes 0-1/"));
+        assert!(resp.headers().get("Accept-Ranges").is_some());
+    }
 }

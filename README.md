@@ -1,6 +1,6 @@
 Rust 版 Fake HuggingFace 服务器（Axum）
 
-- 目标：一比一复刻 `main.py` 的 API 与行为，并在 I/O 与范围下载上做流式优化与轻量缓存。
+- 目标：模拟 huggingface网站 download 功能的API 与行为，并在 I/O 与范围下载上做流式优化与轻量缓存。
 - 技术：Axum + Tokio，按需读取、分块传输，TTL 内存缓存（以空间换时间）。
 
 架构

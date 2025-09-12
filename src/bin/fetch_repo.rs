@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use glob::Pattern;
-use percent_encoding::{utf8_percent_encode, percent_decode_str, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -40,7 +40,10 @@ impl RepoTypeArg {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "fetch_repo", about = "Skeletonize a real HF repo (structure + filenames only)")]
+#[command(
+    name = "fetch_repo",
+    about = "Skeletonize a real HF repo (structure + filenames only)"
+)]
 struct Opt {
     /// Repository ID, e.g., 'gpt2' or 'org/name'
     repo_id: String,
@@ -110,15 +113,13 @@ fn env_default_endpoint() -> String {
 }
 
 fn env_default_root() -> PathBuf {
-    PathBuf::from(
-        std::env::var("FAKE_HUB_ROOT").unwrap_or_else(|_| "fake_hub".to_string()),
-    )
+    PathBuf::from(std::env::var("FAKE_HUB_ROOT").unwrap_or_else(|_| "fake_hub".to_string()))
 }
 
 // Encode set for a single path segment: keep ALPHA / DIGIT / - . _ ~ unescaped
 // and escape '/', '%', '?' , '#', spaces and controls.
 const SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
-    .add(b' ')  // space
+    .add(b' ') // space
     .add(b'%')
     .add(b'?')
     .add(b'#')
@@ -166,7 +167,7 @@ fn fetch_repo_tree(
     );
     if let Some(t) = token {
         if !t.is_empty() {
-            let hv = HeaderValue::from_str(&format!("Bearer {}", t)).map_err(|e| e.to_string())?;
+            let hv = HeaderValue::from_str(&format!("Bearer {t}")).map_err(|e| e.to_string())?;
             headers.insert(AUTHORIZATION, hv);
         }
     }
@@ -183,10 +184,7 @@ fn fetch_repo_tree(
     let status = resp.status();
     let text = resp.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!(
-            "HTTP {} calling {}\nResponse: {}",
-            status, url, text
-        ));
+        return Err(format!("HTTP {status} calling {url}\nResponse: {text}"));
     }
 
     let data: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -218,7 +216,10 @@ fn fetch_repo_tree(
                     if tnorm == "file" || tnorm == "blob" {
                         let mut lfs_oid = None;
                         if let Some(lfs) = obj.get("lfs").and_then(|v| v.as_object()) {
-                            lfs_oid = lfs.get("oid").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            lfs_oid = lfs
+                                .get("oid")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
                         }
                         out.push(TreeItem {
                             path: path.to_string(),
@@ -234,7 +235,10 @@ fn fetch_repo_tree(
         let kind = repo_type.as_singular();
         return Err(format!(
             "{} tree unavailable or empty for '{}' at {} ({})",
-            capitalize(kind), repo_id, revision, endpoint
+            capitalize(kind),
+            repo_id,
+            revision,
+            endpoint
         ));
     }
     Ok(out)
@@ -288,7 +292,7 @@ fn dest_root(repo_type: &RepoTypeArg, repo_id: &str, override_dst: Option<&Path>
 
 fn normalize_rel(rel: &str) -> Result<PathBuf, String> {
     if Path::new(rel).is_absolute() {
-        return Err(format!("Absolute path not allowed: {}", rel));
+        return Err(format!("Absolute path not allowed: {rel}"));
     }
     // Normalize manually to prevent escaping root
     let mut parts: Vec<&str> = Vec::new();
@@ -299,7 +303,7 @@ fn normalize_rel(rel: &str) -> Result<PathBuf, String> {
         }
         if seg == ".." {
             if parts.pop().is_none() {
-                return Err(format!("Suspicious path outside root: {}", rel));
+                return Err(format!("Suspicious path outside root: {rel}"));
             }
             continue;
         }
@@ -313,7 +317,7 @@ fn normalize_rel(rel: &str) -> Result<PathBuf, String> {
 }
 
 fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let nroot = fs::canonicalize(root).map_err(|e| format!("canonicalize root: {}", e))?;
+    let nroot = fs::canonicalize(root).map_err(|e| format!("canonicalize root: {e}"))?;
     let norm = normalize_rel(rel)?;
     let joined = nroot.join(&norm);
     // Ensure within root
@@ -326,7 +330,7 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| "non-utf8 path".to_string())?
         .to_string();
     if !(jp.starts_with(&(rp.clone() + std::path::MAIN_SEPARATOR_STR)) || jp == rp) {
-        return Err(format!("Suspicious path outside root: {}", rel));
+        return Err(format!("Suspicious path outside root: {rel}"));
     }
     Ok(joined)
 }
@@ -362,7 +366,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
         }
     }
     if num.is_empty() {
-        return Err(format!("Invalid size: {}", s));
+        return Err(format!("Invalid size: {s}"));
     }
     let n: u64 = num.parse::<u64>().map_err(|e| e.to_string())?;
     let u = unit.trim().to_ascii_lowercase();
@@ -374,7 +378,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
         "kib" | "ki" => n * 1024,
         "mib" | "mi" => n * 1024 * 1024,
         "gib" | "gi" => n * 1024 * 1024 * 1024,
-        _ => return Err(format!("Unknown size unit in: {}", s)),
+        _ => return Err(format!("Unknown size unit in: {s}")),
     })
 }
 
@@ -389,7 +393,11 @@ fn write_filled_file(p: &Path, size_bytes: u64, pattern: &[u8], force: bool) -> 
         File::create(p).map_err(|e| e.to_string())?;
         return Ok(());
     }
-    let pat = if pattern.is_empty() { &[0u8][..] } else { pattern };
+    let pat = if pattern.is_empty() {
+        &[0u8][..]
+    } else {
+        pattern
+    };
     let target_chunk: usize = 1024 * 1024; // 1 MiB
     let reps = std::cmp::max(1, target_chunk / std::cmp::max(1, pat.len()));
     let mut chunk = Vec::with_capacity(target_chunk);
@@ -433,10 +441,7 @@ fn hash_file(path: &Path) -> Result<(String, String), String> {
         h1.update(&buf[..n]);
         h256.update(&buf[..n]);
     }
-    Ok((
-        hex::encode(h1.finalize()),
-        hex::encode(h256.finalize()),
-    ))
+    Ok((hex::encode(h1.finalize()), hex::encode(h256.finalize())))
 }
 
 fn write_paths_info_sidecar(
@@ -445,7 +450,7 @@ fn write_paths_info_sidecar(
     dry_run: bool,
 ) -> Result<Option<PathBuf>, String> {
     // Canonicalize root to ensure we can derive correct relative paths
-    let root_abs = dunce::canonicalize(dst_root).map_err(|e| format!("canonicalize root: {}", e))?;
+    let root_abs = dunce::canonicalize(dst_root).map_err(|e| format!("canonicalize root: {e}"))?;
     let mut entries: Vec<Value> = Vec::new();
     for (abs_path, is_lfs) in created_paths {
         if abs_path.is_file() {
@@ -486,9 +491,7 @@ fn write_paths_info_sidecar(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
 
-    let endpoint = opt
-        .endpoint
-        .unwrap_or_else(|| env_default_endpoint());
+    let endpoint = opt.endpoint.unwrap_or_else(env_default_endpoint);
     let token = opt
         .token
         .or_else(|| std::env::var("HF_TOKEN").ok())
@@ -502,11 +505,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &opt.repo_type,
         &opt.revision,
         token.as_deref(),
-        opt.no_proxy
+        opt.no_proxy,
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {e}");
             return Ok(());
         }
     };
@@ -522,7 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Destination root
     let dst_root = dest_root(&opt.repo_type, &opt.repo_id, opt.dst.as_deref());
-    ensure_dir(&dst_root).map_err(|e| format!("create root: {}", e))?;
+    ensure_dir(&dst_root).map_err(|e| format!("create root: {e}"))?;
 
     // Resolve filler options
     let mut fill_size_bytes: Option<u64> = None;
@@ -544,7 +547,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let abs = match safe_join(&dst_root, &it.path) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("Warning: {}", e);
+                eprintln!("Warning: {e}");
                 continue;
             }
         };
@@ -565,7 +568,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match write_paths_info_sidecar(&dst_root, &created_abs, opt.dry_run) {
         Ok(Some(sc)) => println!("Wrote sidecar: {}", sc.display()),
         Ok(None) => {}
-        Err(e) => eprintln!("Warning: failed to write .paths-info.json: {}", e),
+        Err(e) => eprintln!("Warning: failed to write .paths-info.json: {e}"),
     }
 
     println!("Skeleton root: {}", dst_root.display());
@@ -576,7 +579,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(p)
             .to_string_lossy()
             .to_string();
-        println!("  {}", rel);
+        println!("  {rel}");
     }
 
     Ok(())
