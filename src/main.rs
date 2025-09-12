@@ -170,20 +170,27 @@ async fn log_requests_mw(
         }
     }
 
-    // Optionally log JSON body
+    // Optionally log JSON body, without consuming it for downstream handlers.
+    // Read the full body into memory, log a truncated snippet, and restore it.
     let mut body_snippet: Option<String> = None;
     let should_log_body =
         state.log_body_all || ct.to_ascii_lowercase().contains("application/json");
     if should_log_body {
         let (parts, body) = req.into_parts();
-        match axum::body::to_bytes(body, state.log_body_max).await {
+        // Use an effectively unlimited read limit so downstream still sees the full body.
+        // Only the logged snippet is truncated to log_body_max.
+        match axum::body::to_bytes(body, usize::MAX).await {
             Ok(bytes) => {
-                let s = String::from_utf8_lossy(&bytes).to_string();
-                body_snippet = if !s.is_empty() { Some(s) } else { None };
-                // reassemble request with original body bytes
+                let slice_len = std::cmp::min(bytes.len(), state.log_body_max);
+                if slice_len > 0 {
+                    let s = String::from_utf8_lossy(&bytes[..slice_len]).to_string();
+                    body_snippet = if !s.is_empty() { Some(s) } else { None };
+                }
+                // Reassemble request with original full body bytes
                 req = AxRequest::from_parts(parts, Body::from(bytes));
             }
             Err(_) => {
+                // In rare errors, avoid panicking and pass an empty body downstream.
                 req = AxRequest::from_parts(parts, Body::empty());
             }
         }
