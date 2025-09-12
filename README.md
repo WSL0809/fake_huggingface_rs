@@ -84,15 +84,17 @@ cargo run --bin fetch_repo -- -t model user/repo
 - `--fill` 按固定大小写入重复内容（代替空文件）
 - `--fill-size` 大小（例如 `16MiB`，若未指定则默认 16MiB）
 - `--fill-content` 重复内容字符串（默认 0 字节）
+- `--fill-from-metadata` 若远端返回了文件大小，则按其大小填充（优先于 `--fill-size`）
 - `--no-proxy` 忽略系统代理（默认遵循系统代理）
  - 简单生成模式（无需访问网络）：
    - `--gen-count <N>` 与 `--gen-avg-size <SIZE>`
-   - 在仓库根下生成 N 个扁平文件（`file_00001.bin`…），每个大小为 `<SIZE>`；支持 `--fill-content` 自定义填充字节模式。
+   - 在仓库根下生成 N 个扁平文件（`file_00001.bin`…），每个大小为 `<SIZE>`；文件内容为随机字节；不接受 `--fill-content`。
 
 实现细节：
 - 通过 `GET /api/{models|datasets}/{repo}/tree/{rev}?recursive=1&expand=1` 获取文件列表；必要时携带 Bearer Token。
 - `repo_id` 每个路径段会做 URL 安全转码；即使传入已编码的 `HunyuanImage%2D2%2E1` 也会先解码再正确编码，避免二次编码。
 - 本地实际写入的文件用于计算 `.paths-info.json`（含 sha1 与 sha256），与服务器 HEAD ETag 逻辑一致（LFS 文件使用 `lfs.oid` 形如 `sha256:<hex>`，普通文件使用 `oid`）。
+- 生成 `.paths-info.json` 时对文件哈希进行并行计算：按 CPU 并发切片，单线程仅占用 ~1MiB 缓冲，提升大型仓库生成速度。
 - 默认遵循系统代理（`HTTP(S)_PROXY`/`ALL_PROXY`）；如需显式忽略代理，使用 `--no-proxy`。
 - 远端错误会打印状态码与响应体，便于定位鉴权/修订问题。
 
@@ -107,5 +109,6 @@ cargo run --bin fetch_repo -- -t model user/repo
 
 简单生成模式示例
 ```bash
-cargo run --bin fetch_repo -- user/repo -t model --gen-count 100 --gen-avg-size 16MiB --fill-content X
+cargo run --bin fetch_repo -- user/repo -t model --gen-count 100 --gen-avg-size 16MiB
+# 简单模式文件内容为随机字节；不可与 --fill-content 同用
 ```

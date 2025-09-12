@@ -99,6 +99,7 @@ struct Opt {
     fill_size: Option<String>,
 
     /// Content string to repeat when filling files (default: zeros)
+    /// Note: not accepted with simple generation mode (`--gen-*`).
     #[arg(long = "fill-content")]
     fill_content: Option<String>,
 
@@ -459,6 +460,63 @@ fn write_filled_file(p: &Path, size_bytes: u64, pattern: &[u8], force: bool) -> 
     Ok(())
 }
 
+// Lightweight PRNG: splitmix64 for fast, decent distribution (non-crypto).
+fn splitmix64_next(state: &mut u64) -> u64 {
+    let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    *state = z;
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn write_random_file(p: &Path, size_bytes: u64, force: bool) -> Result<(), String> {
+    if p.exists() && !force {
+        return Ok(());
+    }
+    if let Some(parent) = p.parent() {
+        ensure_dir(parent)?;
+    }
+    let mut f = File::create(p).map_err(|e| e.to_string())?;
+    if size_bytes == 0 {
+        return Ok(());
+    }
+    // Seed: high-res time mixed with path hash
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV64 offset basis
+    for b in p.as_os_str().to_string_lossy().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01B3);
+    }
+    let mut state = nanos ^ h.rotate_left(21) ^ 0x9E37_79B9_7F4A_7C15;
+
+    let chunk_len: usize = 1024 * 1024; // 1 MiB
+    let mut buf = vec![0u8; chunk_len];
+    let mut written: u64 = 0;
+    while written < size_bytes {
+        let to_write = std::cmp::min(chunk_len as u64, size_bytes - written) as usize;
+        // Fill buf with PRNG output
+        let mut i = 0;
+        while i + 8 <= to_write {
+            let r = splitmix64_next(&mut state);
+            buf[i..i + 8].copy_from_slice(&r.to_le_bytes());
+            i += 8;
+        }
+        if i < to_write {
+            let r = splitmix64_next(&mut state).to_le_bytes();
+            let rem = to_write - i;
+            buf[i..to_write].copy_from_slice(&r[..rem]);
+        }
+        f.write_all(&buf[..to_write]).map_err(|e| e.to_string())?;
+        written += to_write as u64;
+    }
+    Ok(())
+}
+
 fn hash_file(path: &Path) -> Result<(String, String), String> {
     let mut f = File::open(path).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; 1024 * 1024];
@@ -570,11 +628,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let count = match opt.gen_count { Some(c) if c > 0 => c, Some(_) => { eprintln!("Error: --gen-count must be > 0"); return Ok(()); }, None => { eprintln!("Error: --gen-count is required when using --gen-avg-size"); return Ok(()); } };
         let avg_sz = match &opt.gen_avg_size { Some(s) => match parse_size(s) { Ok(v) => v, Err(e) => { eprintln!("Error: {e}"); return Ok(()); } }, None => { eprintln!("Error: --gen-avg-size is required with --gen-count"); return Ok(()); } };
 
+        // In simple mode, custom fill patterns are not accepted.
+        if opt.fill_content.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+            eprintln!("Error: --fill-content is not accepted in simple generation mode (--gen-*)");
+            return Ok(());
+        }
+
         for i in 1..=count {
             let rel = format!("file_{:05}.bin", i);
             let abs = match safe_join(&dst_root, &rel) { Ok(p) => p, Err(e) => { eprintln!("Warning: {e}"); continue; } };
             if opt.dry_run { created_abs.push((abs, false)); continue; }
-            if let Err(e) = write_filled_file(&abs, avg_sz, &fill_pattern, opt.force) { eprintln!("Warning: write {}: {}", abs.display(), e); continue; }
+            if let Err(e) = write_random_file(&abs, avg_sz, opt.force) { eprintln!("Warning: write {}: {}", abs.display(), e); continue; }
             created_abs.push((abs, false));
         }
     } else {
