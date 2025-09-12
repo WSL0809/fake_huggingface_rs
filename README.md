@@ -18,8 +18,12 @@ Rust 版 Fake HuggingFace 服务器（Axum）
 - `FAKE_HUB_ROOT`：本地“仓库根目录”（默认 `fake_hub`）。数据集位于 `fake_hub/datasets/...`。
 - 日志：`LOG_REQUESTS`、`LOG_BODY_MAX`、`LOG_HEADERS=all|minimal`、`LOG_RESP_HEADERS`、`LOG_REDACT`、`LOG_BODY_ALL`。
 - 缓存：`CACHE_TTL_MS`（默认 2000ms）、`PATHS_INFO_CACHE_CAP`（默认 512）、`SIBLINGS_CACHE_CAP`（默认 256）、`SHA256_CACHE_CAP`（默认 1024）。
+- 远端配置与凭据（给 `fetch_repo` 工具用）：
+  - `HF_REMOTE_ENDPOINT`（默认 `https://huggingface.co`）
+  - `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` / `HUGGINGFACEHUB_API_TOKEN`
+  - 代理：`HTTP(S)_PROXY`、`ALL_PROXY`（例如 `all_proxy=socks5h://127.0.0.1:8235`）
 
-API（与 Python 版对齐）
+API
 - 模型信息
   - `GET /api/models/{repo_id}`
   - `GET /api/models/{repo_id}/revision/{revision}`
@@ -59,15 +63,41 @@ paths-info 语义
 
 生成本地仓库骨架
 ------------------
-可使用二进制工具 `fetch_repo` 调用 HuggingFace 的 `paths-info` 接口，按真实元数据在 `fake_hub` 目录下生成目录结构与占位文件：
+可使用二进制工具 `fetch_repo` 走 HuggingFace 公共 API 的树接口，按真实元数据在 `fake_hub` 目录下生成目录结构与占位文件：
 
 ```bash
-cargo run --bin fetch_repo -- user/repo
+cargo run --bin fetch_repo -- -t model user/repo
 ```
 
 生成时会同时写入 `.paths-info.json` 侧车文件，供服务器在 HEAD 请求中读取 ETag。
 
-参数：
-- `--repo-type models|datasets`（默认 `models`）
-- `--revision`（默认 `main`）
-- `--dest` 目标根目录（默认 `fake_hub`）
+参数（对齐 Python 原型）：
+- `-t, --repo-type model|dataset`（默认 `model`）
+- `-r, --revision`（默认 `main`）
+- `-e, --endpoint` 远端根地址（默认 `HF_REMOTE_ENDPOINT` 或 `https://huggingface.co`）
+- `--token` 访问令牌（也可通过 `HF_TOKEN`、`HUGGING_FACE_HUB_TOKEN`、`HUGGINGFACEHUB_API_TOKEN`）
+- `--include`/`--exclude` 多次指定的 glob 过滤（fnmatch 语义）
+- `--max-files` 限制文件数
+- `--dst` 目标根目录（默认：模型 `fake_hub/<repo>`，数据集 `fake_hub/datasets/<repo>`）
+- `--force` 覆盖现有文件
+- `--dry-run` 只打印不写入
+- `--fill` 按固定大小写入重复内容（代替空文件）
+- `--fill-size` 大小（例如 `16MiB`，若未指定则默认 16MiB）
+- `--fill-content` 重复内容字符串（默认 0 字节）
+- `--no-proxy` 忽略系统代理（默认遵循系统代理）
+
+实现细节：
+- 通过 `GET /api/{models|datasets}/{repo}/tree/{rev}?recursive=1&expand=1` 获取文件列表；必要时携带 Bearer Token。
+- `repo_id` 每个路径段会做 URL 安全转码；即使传入已编码的 `HunyuanImage%2D2%2E1` 也会先解码再正确编码，避免二次编码。
+- 本地实际写入的文件用于计算 `.paths-info.json`（含 sha1 与 sha256），与服务器 HEAD ETag 逻辑一致（LFS 文件使用 `lfs.oid` 形如 `sha256:<hex>`，普通文件使用 `oid`）。
+- 默认遵循系统代理（`HTTP(S)_PROXY`/`ALL_PROXY`）；如需显式忽略代理，使用 `--no-proxy`。
+- 远端错误会打印状态码与响应体，便于定位鉴权/修订问题。
+
+示例
+- 使用系统代理与公共仓库：
+  - `export https_proxy=http://127.0.0.1:8234; export http_proxy=http://127.0.0.1:8234; export all_proxy=socks5h://127.0.0.1:8235`
+  - `cargo run --bin fetch_repo -- tencent/HunyuanImage-2.1 -t model -r main --max-files 20`
+- 只取子目录并填充 1MiB 占位内容：
+  - `cargo run --bin fetch_repo -- tencent/HunyuanImage-2.1 --include 'vae/**' --fill --fill-size 1MiB --fill-content X`
+- 私有仓库或避免限流（使用 Token）：
+  - `export HF_TOKEN=hf_xxx && cargo run --bin fetch_repo -- org/private-repo --token "$HF_TOKEN"`

@@ -433,30 +433,30 @@ async fn build_model_response(
         "_id": format!("local/{}", repo_id),
         "id": repo_id,
         "private": false,
-        "pipeline_tag": "text-generation",
-        "library_name": "transformers",
-        "tags": ["transformers", "gpt2", "text-generation"],
-        "downloads": 0,
-        "likes": 0,
+        // "pipeline_tag": "text-generation",
+        // "library_name": "transformers",
+        // "tags": ["transformers", "gpt2", "text-generation"],
+        // "downloads": 0,
+        // "likes": 0,
         "modelId": repo_id,
-        "author": "local-user",
+        // "author": "local-user",
         "sha": fake_sha,
-        "lastModified": "1970-01-01T00:00:00.000Z",
-        "createdAt": "1970-01-01T00:00:00.000Z",
-        "gated": false,
-        "disabled": false,
-        "widgetData": [{"text": "Hello"}],
+        // "lastModified": "1970-01-01T00:00:00.000Z",
+        // "createdAt": "1970-01-01T00:00:00.000Z",
+        // "gated": false,
+        // "disabled": false,
+        // "widgetData": [{"text": "Hello"}],
         "model-index": Value::Null,
-        "config": {"architectures": ["GPT2LMHeadModel"], "model_type": "gpt2", "tokenizer_config": {}},
-        "cardData": {"language": "en", "tags": ["example"], "license": "mit"},
-        "transformersInfo": {
-            "auto_model": "AutoModelForCausalLM",
-            "pipeline_tag": "text-generation",
-            "processor": "AutoTokenizer",
-        },
-        "safetensors": {"parameters": {"F32": 0}, "total": 0},
+        // "config": {"architectures": ["GPT2LMHeadModel"], "model_type": "gpt2", "tokenizer_config": {}},
+        // "cardData": {"language": "en", "tags": ["example"], "license": "mit"},
+        // "transformersInfo": {
+        //     "auto_model": "AutoModelForCausalLM",
+        //     "pipeline_tag": "text-generation",
+        //     "processor": "AutoTokenizer",
+        // },
+        // "safetensors": {"parameters": {"F32": 0}, "total": 0},
         "siblings": siblings,
-        "spaces": [],
+        // "spaces": [],
         "usedStorage": (total_size as i64),
     });
     Ok(val)
@@ -537,15 +537,15 @@ async fn build_dataset_response(
                 "id": repo_id,
                 "private": false,
                 "tags": ["dataset"],
-                "downloads": 0,
-                "likes": 0,
-                "author": "local-user",
+                // "downloads": 0,
+                // "likes": 0,
+                // "author": "local-user",
                 "sha": fake_sha,
-                "lastModified": "1970-01-01T00:00:00.000Z",
-                "createdAt": "1970-01-01T00:00:00.000Z",
-                "gated": false,
-                "disabled": false,
-                "cardData": {"license": "mit", "language": ["en"]},
+                // "lastModified": "1970-01-01T00:00:00.000Z",
+                // "createdAt": "1970-01-01T00:00:00.000Z",
+                // "gated": false,
+                // "disabled": false,
+                // "cardData": {"license": "mit", "language": ["en"]},
                 "siblings": hit.siblings,
                 "usedStorage": (hit.total as i64),
             });
@@ -1116,7 +1116,7 @@ async fn resolve_catchall(
     full_file_response(&filepath, None).await
 }
 
-async fn full_file_response(path: &Path, filename: Option<&str>) -> Response {
+async fn full_file_response(path: &Path, _filename: Option<&str>) -> Response {
     // Read entire file into body stream using tokio_util::io::ReaderStream if desired.
     // For simplicity and parity, we use a streaming reader.
     let file = match fs::File::open(path).await {
@@ -1254,7 +1254,7 @@ fn parse_range(h: &str, total: u64) -> RangeParse {
         let end = if total > 0 { total - 1 } else { 0 };
         return RangeParse::Ok(start, end);
     } else {
-        let Ok(mut start) = a.parse::<u64>() else {
+        let Ok(start) = a.parse::<u64>() else {
             return RangeParse::Invalid;
         };
         let mut end = if b.is_empty() {
