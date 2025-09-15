@@ -433,6 +433,13 @@ async fn build_model_response(
         cache.inner.get(&cache_key).cloned()
     } {
         if now.duration_since(hit.at) < state.cache_ttl {
+            // LRU refresh on hit
+            let fresh = Instant::now();
+            let mut cachew = SIBLINGS_CACHE.write().await;
+            if let Some(entry) = cachew.inner.get_mut(&cache_key) {
+                entry.at = fresh;
+                cachew.evict_q.push_back((cache_key.clone(), fresh));
+            }
             let val = build_repo_json(
                 RepoKind::Model,
                 repo_id,
@@ -564,6 +571,12 @@ async fn build_dataset_response(
         cache.inner.get(&cache_key).cloned()
     } {
         if now.duration_since(hit.at) < state.cache_ttl {
+            let fresh = Instant::now();
+            let mut cachew = SIBLINGS_CACHE.write().await;
+            if let Some(entry) = cachew.inner.get_mut(&cache_key) {
+                entry.at = fresh;
+                cachew.evict_q.push_back((cache_key.clone(), fresh));
+            }
             let val = build_repo_json(
                 RepoKind::Dataset,
                 repo_id,
@@ -676,6 +689,15 @@ async fn paths_info_response(
         cache.inner.get(&cache_key).cloned()
     } {
         if Instant::now().duration_since(hit.at) < state.cache_ttl {
+            // LRU refresh on hit
+            let fresh = Instant::now();
+            let mut cachew = PATHS_INFO_CACHE.write().await;
+            let cloned_items = if let Some(entry) = cachew.inner.get_mut(&cache_key) {
+                entry.at = fresh;
+                Some(entry.items.clone())
+            } else { None };
+            cachew.evict_q.push_back((cache_key.clone(), fresh));
+            if let Some(items) = cloned_items { return Ok(items); }
             return Ok(hit.items);
         }
     }
@@ -711,7 +733,7 @@ async fn paths_info_response(
                     }
                     results.push(Value::Object(rec));
                 } else {
-                    let size = file_size(&abs_target).unwrap_or(0);
+                    let size = fs::metadata(&abs_target).await.ok().map(|m| m.len()).unwrap_or(0);
                     results.push(json!({ "path": rel_norm, "type": "file", "size": (size as i64) }));
                 }
                 // continue into de-dup + cache insert below
@@ -743,7 +765,7 @@ async fn paths_info_response(
                         let rel_norm = norm_rel.replace('\\', "/");
                         if let Some(sc) = sc_map.get(&rel_norm) {
                             let sidecar_size = sc.get("size").and_then(|v| v.as_i64()).or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64()));
-                            let size_i64 = match sidecar_size { Some(s) if s >= 0 => s, _ => file_size(&abs_target).unwrap_or(0) as i64 };
+                            let size_i64 = match sidecar_size { Some(s) if s >= 0 => s, _ => fs::metadata(&abs_target).await.ok().map(|m| m.len()).unwrap_or(0) as i64 };
                             let mut rec = serde_json::Map::new();
                             rec.insert("path".to_string(), json!(rel_norm));
                             rec.insert("type".to_string(), json!("file"));
@@ -774,7 +796,7 @@ async fn paths_info_response(
                             let rel_norm = norm_rel.replace('\\', "/");
                             if let Some(sc) = sc_map.get(&rel_norm) {
                                 let sidecar_size = sc.get("size").and_then(|v| v.as_i64()).or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64()));
-                                let size_i64 = match sidecar_size { Some(s) if s >= 0 => s, _ => file_size(&abs_target).unwrap_or(0) as i64 };
+                                    let size_i64 = match sidecar_size { Some(s) if s >= 0 => s, _ => fs::metadata(&abs_target).await.ok().map(|m| m.len()).unwrap_or(0) as i64 };
                                 let mut rec = serde_json::Map::new();
                                 rec.insert("path".to_string(), json!(rel_norm));
                                 rec.insert("type".to_string(), json!("file"));
@@ -792,7 +814,7 @@ async fn paths_info_response(
                             }
                         }
                         // Fallback: single file info without sidecar
-                        let size = file_size(&abs_target).unwrap_or(0);
+                            let size = fs::metadata(&abs_target).await.ok().map(|m| m.len()).unwrap_or(0);
                         results.push(json!({"path": norm_rel.replace('\\', "/"), "type": "file", "size": (size as i64)}));
                     }
                 }
@@ -854,6 +876,14 @@ async fn sha256_file_cached(state: &AppState, p: &Path) -> io::Result<String> {
         cache.inner.get(&key).cloned()
     } {
         if Instant::now().duration_since(hit.at) < state.cache_ttl {
+            let fresh = Instant::now();
+            let mut cachew = SHA256_CACHE.write().await;
+            let cloned = if let Some(entry) = cachew.inner.get_mut(&key) {
+                entry.at = fresh;
+                Some(entry.sum.clone())
+            } else { None };
+            cachew.evict_q.push_back((key.clone(), fresh));
+            if let Some(sum) = cloned { return Ok(sum); }
             return Ok(hit.sum);
         }
     }

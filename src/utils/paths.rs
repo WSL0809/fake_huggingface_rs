@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use tokio::fs;
 
 // Normalize a relative path, rejecting absolute segments and attempts to escape root.
 pub fn normalize_rel(rel: &str) -> Option<PathBuf> {
@@ -44,8 +45,10 @@ pub fn normalize_join_abs(base: &Path, rel: &str) -> PathBuf {
     dunce::canonicalize(&joined).unwrap_or(joined)
 }
 
-pub fn file_size(p: &Path) -> std::io::Result<u64> {
-    Ok(p.metadata()?.len())
+pub fn file_size(p: &Path) -> std::io::Result<u64> { Ok(p.metadata()?.len()) }
+
+pub async fn file_size_async(p: &Path) -> u64 {
+    fs::metadata(p).await.ok().map(|m| m.len()).unwrap_or(0)
 }
 
 pub fn is_sidecar_path(p: &str) -> bool {

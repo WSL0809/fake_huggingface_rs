@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use tokio::fs;
 
 use crate::caches::SidecarMap;
-use crate::utils::paths::{file_size, normalize_join_abs};
+use crate::utils::paths::normalize_join_abs;
 use crate::utils::sidecar::get_sidecar_map;
 
 pub async fn collect_paths_info(
@@ -17,11 +17,10 @@ pub async fn collect_paths_info(
     let mut results: Vec<Value> = Vec::new();
     let sidecar_map = get_sidecar_map(&base_abs).await.unwrap_or_default();
 
-    fn build_file_entry(abs_path: &Path, rel_path: &str, sidecar_map: &SidecarMap) -> Value {
+    fn build_file_entry_with_size(rel_path: &str, sidecar_map: &SidecarMap, pre_size: Option<u64>) -> Value {
         let rel_norm = rel_path.replace('\\', "/");
         if let Some(sc) = sidecar_map.get(&rel_norm) {
-            // Prefer sidecar-provided size (and lfs.size) to avoid extra filesystem metadata calls
-            // under load. Fall back to metadata if size is missing in sidecar.
+            // Prefer sidecar-provided size (and lfs.size). Fall back to precomputed size if missing.
             let sidecar_size = sc
                 .get("size")
                 .and_then(|v| v.as_i64())
@@ -30,9 +29,10 @@ pub async fn collect_paths_info(
                         .and_then(|v| v.get("size"))
                         .and_then(|v| v.as_i64())
                 });
-            let size_i64 = match sidecar_size {
-                Some(s) if s >= 0 => s,
-                _ => file_size(abs_path).unwrap_or(0) as i64,
+            let size_i64 = match (sidecar_size, pre_size) {
+                (Some(s), _) if s >= 0 => s,
+                (_, Some(ps)) => ps as i64,
+                _ => 0,
             };
 
             let mut rec = serde_json::Map::new();
@@ -57,7 +57,7 @@ pub async fn collect_paths_info(
             }
             return Value::Object(rec);
         }
-        let size = file_size(abs_path).unwrap_or(0);
+        let size = pre_size.unwrap_or(0);
         json!({
             "path": rel_norm,
             "type": "file",
@@ -80,7 +80,8 @@ pub async fn collect_paths_info(
             let mut rd = fs::read_dir(&dir).await?;
             while let Ok(Some(ent)) = rd.next_entry().await {
                 let path = ent.path();
-                if path.is_dir() {
+                let is_dir = match ent.file_type().await { Ok(t) => t.is_dir(), Err(_) => false };
+                if is_dir {
                     stack.push(path);
                     continue;
                 }
@@ -91,7 +92,8 @@ pub async fn collect_paths_info(
                 }
                 let rel = pathdiff::diff_paths(&path, base_dir).unwrap_or(path.clone());
                 let rel_str = rel.to_string_lossy().to_string();
-                out.push(build_file_entry(&path, &rel_str, sidecar_map));
+                let size = ent.metadata().await.ok().map(|m| m.len());
+                out.push(build_file_entry_with_size(&rel_str, sidecar_map, size));
             }
         }
         Ok(out)
@@ -103,14 +105,16 @@ pub async fn collect_paths_info(
         if !(abs_target.starts_with(&base_abs) || abs_target == base_abs) {
             return Ok(results);
         }
-        if abs_target.is_dir() {
-            if let Ok(mut v) =
-                walk_dir_collect(&base_abs, &abs_target, norm_rel, &sidecar_map).await
-            {
-                results.append(&mut v);
+        match fs::metadata(&abs_target).await {
+            Ok(md) if md.is_dir() => {
+                if let Ok(mut v) = walk_dir_collect(&base_abs, &abs_target, norm_rel, &sidecar_map).await {
+                    results.append(&mut v);
+                }
             }
-        } else if abs_target.is_file() {
-            results.push(build_file_entry(&abs_target, norm_rel, &sidecar_map));
+            Ok(md) if md.is_file() => {
+                results.push(build_file_entry_with_size(norm_rel, &sidecar_map, Some(md.len())));
+            }
+            _ => {}
         }
         return Ok(results);
     }
