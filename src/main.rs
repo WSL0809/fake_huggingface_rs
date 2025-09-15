@@ -367,10 +367,11 @@ async fn get_model_catchall_get(
         if !repo_path.is_dir() {
             return http_not_found("Repository not found");
         }
-        match utils::fs_walk::collect_paths_info(&repo_path, None).await {
-            Ok(vals) => return Json(vals).into_response(),
-            Err(e) => return e,
+        // Sidecar required: error if missing/incomplete
+        if let Some(vals) = utils::fs_walk::collect_paths_info_from_sidecar(&repo_path).await {
+            return Json(vals).into_response();
         }
+        return http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete");
     }
     if parts.len() >= 3 && parts[parts.len() - 2] == "revision" {
         let revision = parts.last().unwrap_or(&"");
@@ -452,9 +453,13 @@ async fn build_model_response(
         }
     }
 
-    // Miss or expired: compute
+    // Sidecar required: compute siblings strictly from sidecar
     let (siblings, total_size): (Vec<Value>, u64) =
-        list_siblings_except_sidecar(&repo_path).await.unwrap_or_default();
+        if let Some((s, t)) = utils::fs_walk::siblings_from_sidecar(&repo_path).await {
+            (s, t)
+        } else {
+            return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete"));
+        };
     // Insert to cache (bounded)
     {
         let mut cache = SIBLINGS_CACHE.write().await;
@@ -504,10 +509,10 @@ async fn get_dataset_catchall_get(
         if !ds_path.is_dir() {
             return http_not_found("Dataset not found");
         }
-        match utils::fs_walk::collect_paths_info(&ds_path, None).await {
-            Ok(vals) => return Json(vals).into_response(),
-            Err(e) => return e,
+        if let Some(vals) = utils::fs_walk::collect_paths_info_from_sidecar(&ds_path).await {
+            return Json(vals).into_response();
         }
+        return http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete");
     }
     if parts.len() >= 3 && parts[parts.len() - 2] == "revision" {
         let revision = parts.last().unwrap_or(&"");
@@ -590,7 +595,11 @@ async fn build_dataset_response(
     }
 
     let (siblings, total_size): (Vec<Value>, u64) =
-        list_siblings_except_sidecar(&ds_path).await.unwrap_or_default();
+        if let Some((s, t)) = utils::fs_walk::siblings_from_sidecar(&ds_path).await {
+            (s, t)
+        } else {
+            return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete"));
+        };
     {
         let mut cache = SIBLINGS_CACHE.write().await;
         if cache.inner.len() >= state.siblings_cache_cap {
@@ -703,22 +712,39 @@ async fn paths_info_response(
     }
 
     let mut results: Vec<Value> = Vec::new();
-
-    // Fast path: common case of a single file path; avoid re-walking and avoid cloning sidecar map multiple times.
-    if paths.len() == 1 {
-        let trimmed = paths[0].trim();
-        if !(trimmed.is_empty() || trimmed == "/" || trimmed == ".") {
+    let sc_map = get_sidecar_map(&base_abs).await.unwrap_or_default();
+    if paths.is_empty() {
+        if expand {
+            if let Some(vals) = utils::fs_walk::collect_paths_info_from_sidecar(&base_abs).await {
+                results = vals;
+            } else {
+                return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete"));
+            }
+        } else {
+            results.push(json!({"path": "", "type": "directory"}));
+        }
+    } else {
+        for p in paths {
+            let trimmed = p.trim();
+            if trimmed.is_empty() || trimmed == "/" || trimmed == "." {
+                if expand {
+                    if let Some(vals) = utils::fs_walk::collect_paths_info_from_sidecar(&base_abs).await {
+                        results.extend(vals);
+                    } else {
+                        return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete"));
+                    }
+                } else {
+                    results.push(json!({"path": "", "type": "directory"}));
+                }
+                continue;
+            }
             let norm_rel = trimmed.trim_start_matches('/');
-            let abs_target = normalize_join_abs(&base_abs, norm_rel);
-            if (abs_target.starts_with(&base_abs) || abs_target == base_abs) && abs_target.is_file() {
-                let sc_map = get_sidecar_map(&base_abs).await.unwrap_or_default();
-                let rel_norm = norm_rel.replace('\\', "/");
+            let rel_norm = norm_rel.replace('\\', "/");
+            if expand {
                 if let Some(sc) = sc_map.get(&rel_norm) {
-                    let sidecar_size = sc
-                        .get("size")
-                        .and_then(|v| v.as_i64())
-                        .or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64()));
-                    let size_i64 = match sidecar_size { Some(s) if s >= 0 => s, _ => file_size(&abs_target).unwrap_or(0) as i64 };
+                    let Some(size_i64) = sc.get("size").and_then(|v| v.as_i64()).or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64())) else {
+                        return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing size"));
+                    };
                     let mut rec = serde_json::Map::new();
                     rec.insert("path".to_string(), json!(rel_norm));
                     rec.insert("type".to_string(), json!("file"));
@@ -733,90 +759,49 @@ async fn paths_info_response(
                     }
                     results.push(Value::Object(rec));
                 } else {
-                    let size = fs::metadata(&abs_target).await.ok().map(|m| m.len()).unwrap_or(0);
-                    results.push(json!({ "path": rel_norm, "type": "file", "size": (size as i64) }));
-                }
-                // continue into de-dup + cache insert below
-            }
-        }
-    }
-    // Prepare sidecar_map once for multi-path cases
-    let sc_map_for_multi = if !paths.is_empty() { get_sidecar_map(&base_abs).await.ok() } else { None };
-
-    if paths.is_empty() {
-        results = collect_paths_info(&base_abs, None).await?;
-    } else {
-        for p in paths {
-            let trimmed = p.trim();
-            if trimmed.is_empty() || trimmed == "/" || trimmed == "." {
-                if expand {
-                    results.extend(collect_paths_info(&base_abs, None).await?);
-                } else {
-                    results.push(json!({"path": "", "type": "directory"}));
-                }
-                continue;
-            }
-            if expand {
-                // If it's a file, avoid full walk and use sidecar fast path
-                let norm_rel = trimmed.trim_start_matches('/');
-                let abs_target = normalize_join_abs(&base_abs, norm_rel);
-                if (abs_target.starts_with(&base_abs) || abs_target == base_abs) && abs_target.is_file() {
-                    if let Some(sc_map) = sc_map_for_multi.as_ref() {
-                        let rel_norm = norm_rel.replace('\\', "/");
-                        if let Some(sc) = sc_map.get(&rel_norm) {
-                            let sidecar_size = sc.get("size").and_then(|v| v.as_i64()).or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64()));
-                            let size_i64 = match sidecar_size { Some(s) if s >= 0 => s, _ => fs::metadata(&abs_target).await.ok().map(|m| m.len()).unwrap_or(0) as i64 };
+                    results.push(json!({"path": rel_norm.clone(), "type": "directory"}));
+                    let prefix = if rel_norm.is_empty() { String::new() } else { format!("{}/", rel_norm) };
+                    for (k, v) in sc_map.iter() {
+                        if prefix.is_empty() || k.starts_with(&prefix) {
+                            let Some(size_i64) = v.get("size").and_then(|x| x.as_i64()).or_else(|| v.get("lfs").and_then(|x| x.get("size")).and_then(|x| x.as_i64())) else {
+                                return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing size"));
+                            };
                             let mut rec = serde_json::Map::new();
-                            rec.insert("path".to_string(), json!(rel_norm));
+                            rec.insert("path".to_string(), json!(k));
                             rec.insert("type".to_string(), json!("file"));
                             rec.insert("size".to_string(), json!(size_i64));
-                            if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) { rec.insert("oid".to_string(), json!(oid)); }
-                            if let Some(lfs) = sc.get("lfs").and_then(|v| v.as_object()) {
+                            if let Some(oid) = v.get("oid").and_then(|x| x.as_str()) { rec.insert("oid".to_string(), json!(oid)); }
+                            if let Some(lfs) = v.get("lfs").and_then(|x| x.as_object()) {
                                 let mut ldict = serde_json::Map::new();
-                                if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) { ldict.insert("oid".to_string(), json!(loid)); }
-                                let lfs_size = lfs.get("size").and_then(|v| v.as_i64()).unwrap_or(size_i64);
+                                if let Some(loid) = lfs.get("oid").and_then(|x| x.as_str()) { ldict.insert("oid".to_string(), json!(loid)); }
+                                let lfs_size = lfs.get("size").and_then(|x| x.as_i64()).unwrap_or(size_i64);
                                 ldict.insert("size".to_string(), json!(lfs_size));
                                 rec.insert("lfs".to_string(), Value::Object(ldict));
                             }
                             results.push(Value::Object(rec));
-                            continue;
                         }
                     }
                 }
-                // Directory or no sidecar: fall back to walk
-                results.extend(collect_paths_info(&base_abs, Some(trimmed)).await?);
             } else {
-                let norm_rel = trimmed.trim_start_matches('/');
-                let abs_target = normalize_join_abs(&base_abs, norm_rel);
-                if abs_target.starts_with(&base_abs) || abs_target == base_abs {
-                    if abs_target.is_dir() {
-                        results.push(json!({"path": norm_rel.replace('\\', "/"), "type": "directory"}));
-                    } else if abs_target.is_file() {
-                        if let Some(sc_map) = sc_map_for_multi.as_ref() {
-                            let rel_norm = norm_rel.replace('\\', "/");
-                            if let Some(sc) = sc_map.get(&rel_norm) {
-                                let sidecar_size = sc.get("size").and_then(|v| v.as_i64()).or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64()));
-                                    let size_i64 = match sidecar_size { Some(s) if s >= 0 => s, _ => fs::metadata(&abs_target).await.ok().map(|m| m.len()).unwrap_or(0) as i64 };
-                                let mut rec = serde_json::Map::new();
-                                rec.insert("path".to_string(), json!(rel_norm));
-                                rec.insert("type".to_string(), json!("file"));
-                                rec.insert("size".to_string(), json!(size_i64));
-                                if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) { rec.insert("oid".to_string(), json!(oid)); }
-                                if let Some(lfs) = sc.get("lfs").and_then(|v| v.as_object()) {
-                                    let mut ldict = serde_json::Map::new();
-                                    if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) { ldict.insert("oid".to_string(), json!(loid)); }
-                                    let lfs_size = lfs.get("size").and_then(|v| v.as_i64()).unwrap_or(size_i64);
-                                    ldict.insert("size".to_string(), json!(lfs_size));
-                                    rec.insert("lfs".to_string(), Value::Object(ldict));
-                                }
-                                results.push(Value::Object(rec));
-                                continue;
-                            }
-                        }
-                        // Fallback: single file info without sidecar
-                            let size = fs::metadata(&abs_target).await.ok().map(|m| m.len()).unwrap_or(0);
-                        results.push(json!({"path": norm_rel.replace('\\', "/"), "type": "file", "size": (size as i64)}));
+                if let Some(sc) = sc_map.get(&rel_norm) {
+                    let Some(size_i64) = sc.get("size").and_then(|v| v.as_i64()).or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64())) else {
+                        return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing size"));
+                    };
+                    let mut rec = serde_json::Map::new();
+                    rec.insert("path".to_string(), json!(rel_norm));
+                    rec.insert("type".to_string(), json!("file"));
+                    rec.insert("size".to_string(), json!(size_i64));
+                    if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) { rec.insert("oid".to_string(), json!(oid)); }
+                    if let Some(lfs) = sc.get("lfs").and_then(|v| v.as_object()) {
+                        let mut ldict = serde_json::Map::new();
+                        if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) { ldict.insert("oid".to_string(), json!(loid)); }
+                        let lfs_size = lfs.get("size").and_then(|v| v.as_i64()).unwrap_or(size_i64);
+                        ldict.insert("size".to_string(), json!(lfs_size));
+                        rec.insert("lfs".to_string(), Value::Object(ldict));
                     }
+                    results.push(Value::Object(rec));
+                } else {
+                    results.push(json!({"path": rel_norm, "type": "directory"}));
                 }
             }
         }
