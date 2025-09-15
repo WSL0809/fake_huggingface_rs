@@ -13,6 +13,8 @@ Rust 版 Fake HuggingFace 服务器（Axum）
 - 开发构建：`cd fake_huggingface_rs && cargo build`
 - 发布构建：`cd fake_huggingface_rs && cargo build --release`
 - 启动：`FAKE_HUB_ROOT=fake_hub ./target/release/fake_huggingface_rs`
+ - 启动输出：会打印绑定地址、本地与局域网可访问地址，例如：
+   - `[fake-hub] Listening on http://0.0.0.0:8000 (local: http://127.0.0.1:8000, lan: http://192.168.1.23:8000)`
 
 环境变量
 - `FAKE_HUB_ROOT`：本地“仓库根目录”（默认 `fake_hub`）。数据集位于 `fake_hub/datasets/...`。
@@ -28,10 +30,12 @@ API
   - `GET /api/models/{repo_id}`
   - `GET /api/models/{repo_id}/revision/{revision}`
   - `POST /api/models/{repo_id}/paths-info/{revision}`
+  - `GET /api/models/{repo_id}/tree/{revision}`（返回数组；支持 `?recursive=1&expand=1`）
 - 数据集信息
   - `GET /api/datasets/{repo_id}`
   - `GET /api/datasets/{repo_id}/revision/{revision}`
   - `POST /api/datasets/{repo_id}/paths-info/{revision}`（在 `FAKE_HUB_ROOT/datasets/{repo_id}` 下）
+  - `GET /api/datasets/{repo_id}/tree/{revision}`（返回数组；支持 `?recursive=1&expand=1`）
 - 文件下载/探测
   - `GET|HEAD /{repo_id}/resolve/{revision}/{filename...}`
   - GET 支持 Range（bytes=...）：返回 206/416；非法 Range 回退 200 全量。
@@ -52,6 +56,8 @@ paths-info 语义
 - 单文件哈希：`curl http://localhost:8000/tencent/HunyuanImage-2.1/sha256/main/config.json`
 - 模型 paths-info：
   - `curl -X POST http://localhost:8000/api/models/tencent/HunyuanImage-2.1/paths-info/main -H 'content-type: application/json' -d '{"paths":["assets/"],"expand":true}'`
+ - 树列举（模型）：
+   - `curl 'http://localhost:8000/api/models/tencent/HunyuanImage-2.1/tree/main?recursive=1&expand=1'`
 
 实现细节
 - 分块大小：256 KiB；Tokio `ReaderStream`/手动读循环，减少系统调用与拷贝。
