@@ -113,6 +113,31 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .expect("bind server");
+    // Print accessible URLs: bound addr + loopback + best-effort LAN IP
+    let bound = listener.local_addr().ok();
+    let loopback_url = format!("http://127.0.0.1:{port}");
+    let lan_ip = local_ipv4_guess();
+    match (bound, lan_ip) {
+        (Some(b), Some(ip)) => println!(
+            "[fake-hub] Listening on http://{} (local: {}, lan: http://{}:{})",
+            b,
+            loopback_url,
+            ip,
+            port
+        ),
+        (Some(b), None) => println!(
+            "[fake-hub] Listening on http://{} (local: {})",
+            b,
+            loopback_url
+        ),
+        (None, Some(ip)) => println!(
+            "[fake-hub] Listening (lan: http://{}:{}, local: {})",
+            ip,
+            port,
+            loopback_url
+        ),
+        _ => println!("[fake-hub] Listening on {host}:{port}"),
+    }
     axum::serve(listener, app).await.expect("server run");
 }
 
@@ -121,6 +146,31 @@ fn init_tracing() {
     let fmt_layer = fmt::layer().with_target(false).with_level(true);
     let subscriber = Registry::default().with(env_filter).with(fmt_layer);
     tracing::subscriber::set_global_default(subscriber).ok();
+}
+
+// Best-effort LAN IPv4 detection without extra crates.
+// Uses UDP connect trick; no packets are sent until write, but OS selects an egress interface.
+fn local_ipv4_guess() -> Option<std::net::Ipv4Addr> {
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+    // Fall back chain to popular public resolvers to improve chances, but we only need routing decision.
+    let candidates = [
+        SocketAddr::from((std::net::IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80)),
+        SocketAddr::from((std::net::IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 80)),
+    ];
+    for dest in candidates {
+        if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+            if s.connect(dest).is_ok() {
+                if let Ok(local) = s.local_addr() {
+                    if let std::net::IpAddr::V4(v4) = local.ip() {
+                        if !v4.is_loopback() && !v4.is_unspecified() {
+                            return Some(v4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 // ============ Middleware (request logging) ==========
@@ -299,6 +349,21 @@ async fn get_model_catchall_get(
 ) -> impl IntoResponse {
     // rest can be "{repo_id}" or "{repo_id}/revision/{revision}"
     let parts: Vec<&str> = rest.split('/').collect();
+    // Support tree listing: /api/models/{repo_id}/tree/{revision}
+    if parts.len() >= 3 && parts[parts.len() - 2] == "tree" {
+        let _revision = parts.last().unwrap_or(&"");
+        let repo_id = parts[..parts.len() - 2].join("/");
+        let Some(repo_path) = secure_join(&state.root, &repo_id) else {
+            return http_not_found("Repository not found");
+        };
+        if !repo_path.is_dir() {
+            return http_not_found("Repository not found");
+        }
+        match utils::fs_walk::collect_paths_info(&repo_path, None).await {
+            Ok(vals) => return Json(vals).into_response(),
+            Err(e) => return e,
+        }
+    }
     if parts.len() >= 3 && parts[parts.len() - 2] == "revision" {
         let revision = parts.last().unwrap_or(&"");
         let repo_id = parts[..parts.len() - 2].join("/");
@@ -420,6 +485,22 @@ async fn get_dataset_catchall_get(
 ) -> impl IntoResponse {
     // rest can be "{repo_id}" or "{repo_id}/revision/{revision}"
     let parts: Vec<&str> = rest.split('/').collect();
+    // Support tree listing: /api/datasets/{repo_id}/tree/{revision}
+    if parts.len() >= 3 && parts[parts.len() - 2] == "tree" {
+        let _revision = parts.last().unwrap_or(&"");
+        let repo_id = parts[..parts.len() - 2].join("/");
+        let ds_base = state.root.join("datasets");
+        let Some(ds_path) = secure_join(&ds_base, &repo_id) else {
+            return http_not_found("Dataset not found");
+        };
+        if !ds_path.is_dir() {
+            return http_not_found("Dataset not found");
+        }
+        match utils::fs_walk::collect_paths_info(&ds_path, None).await {
+            Ok(vals) => return Json(vals).into_response(),
+            Err(e) => return e,
+        }
+    }
     if parts.len() >= 3 && parts[parts.len() - 2] == "revision" {
         let revision = parts.last().unwrap_or(&"");
         let repo_id = parts[..parts.len() - 2].join("/");
