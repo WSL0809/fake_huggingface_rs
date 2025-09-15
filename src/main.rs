@@ -1005,8 +1005,9 @@ async fn resolve_catchall(
             }
             RangeParse::Ok(start, end) => {
                 let length = end - start + 1;
+                let fp_for_stream = filepath.clone();
                 let stream = stream! {
-                    let mut f = match fs::File::open(&filepath).await { Ok(f) => f, Err(e) => { error!("open file: {}", e); yield Err(io::Error::other("open failed")); return; } };
+                    let mut f = match fs::File::open(&fp_for_stream).await { Ok(f) => f, Err(e) => { error!("open file: {}", e); yield Err(io::Error::other("open failed")); return; } };
                     if let Err(e) = f.seek(std::io::SeekFrom::Start(start)).await { error!("seek: {}", e); yield Err(io::Error::other("seek failed")); return; }
                     let mut remaining = length as usize;
                     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -1023,6 +1024,21 @@ async fn resolve_catchall(
                     }
                 };
                 let mut headers = file_headers_common(revision, length);
+                // Strict ETag from sidecar; otherwise 500
+                let mut repo_root = filepath.to_path_buf();
+                let depth = filename.split('/').count();
+                for _ in 0..depth { if let Some(parent) = repo_root.parent() { repo_root = parent.to_path_buf(); } }
+                let sc_map = get_sidecar_map(&repo_root).await.unwrap_or_default();
+                let rel_path = filename.replace('\\', "/");
+                let etag_pair = etag_from_sidecar(&sc_map, &rel_path, total);
+                if etag_pair.is_none() {
+                    error!("ETag missing for range {}@{}:{}", left, revision, rel_path);
+                    return http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available");
+                }
+                let (etag, is_lfs) = etag_pair.unwrap();
+                let quoted = format!("\"{etag}\"");
+                headers.insert("ETag", HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")));
+                if is_lfs { headers.insert("x-lfs-size", HeaderValue::from_str(&total.to_string()).unwrap()); }
                 set_content_range(&mut headers, start, end, total);
                 let body = Body::from_stream(stream);
                 return Response::builder()
@@ -1043,7 +1059,7 @@ async fn resolve_catchall(
 
 async fn full_file_response(
     _state: &AppState,
-    _repo_id: &str,
+    repo_id: &str,
     revision: &str,
     filename: &str,
     path: &Path,
@@ -1057,33 +1073,22 @@ async fn full_file_response(
     let size = file.metadata().await.ok().map(|m| m.len()).unwrap_or(0);
     let stream = tokio_util::io::ReaderStream::with_capacity(file, CHUNK_SIZE);
     let mut headers = file_headers_common(revision, size);
-    // Best-effort ETag for GET: add if available in sidecar; otherwise omit (do not break userspace)
-    // Derive repo_root by stripping the filename components from the absolute filepath to avoid extra joins/canonicalize.
+    // Strict ETag for GET: require from sidecar; otherwise 500
     {
         let mut repo_root = path.to_path_buf();
         let depth = filename.split('/').count();
-        for _ in 0..depth {
-            if let Some(parent) = repo_root.parent() {
-                repo_root = parent.to_path_buf();
-            }
+        for _ in 0..depth { if let Some(parent) = repo_root.parent() { repo_root = parent.to_path_buf(); } }
+        let sc_map = get_sidecar_map(&repo_root).await.unwrap_or_default();
+        let rel_path = filename.replace('\\', "/");
+        let etag_pair = etag_from_sidecar(&sc_map, &rel_path, size);
+        if etag_pair.is_none() {
+            error!("ETag missing for {}@{}:{}", repo_id, revision, rel_path);
+            return http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available");
         }
-        if let Ok(sc_map) = get_sidecar_map(&repo_root).await {
-            let rel_path = filename.replace('\\', "/");
-            if let Some((etag, is_lfs)) = etag_from_sidecar(&sc_map, &rel_path, size) {
-                let quoted = format!("\"{etag}\"");
-                headers.insert(
-                    "ETag",
-                    HeaderValue::from_str(&quoted)
-                        .unwrap_or(HeaderValue::from_static("\"-\"")),
-                );
-                if is_lfs {
-                    headers.insert(
-                        "x-lfs-size",
-                        HeaderValue::from_str(&size.to_string()).unwrap(),
-                    );
-                }
-            }
-        }
+        let (etag, is_lfs) = etag_pair.unwrap();
+        let quoted = format!("\"{etag}\"");
+        headers.insert("ETag", HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")));
+        if is_lfs { headers.insert("x-lfs-size", HeaderValue::from_str(&size.to_string()).unwrap()); }
     }
     let body = Body::from_stream(stream);
     Response::builder()
