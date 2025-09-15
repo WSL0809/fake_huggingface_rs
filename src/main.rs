@@ -20,6 +20,8 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
+use tracing_subscriber::fmt::time::OffsetTime;
+use time::{macros::format_description, UtcOffset};
 use uuid::Uuid;
 
 // Use mimalloc as the global allocator for the server binary
@@ -151,7 +153,14 @@ async fn main() {
 
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let fmt_layer = fmt::layer().with_target(false).with_level(true);
+    // Format timestamp as local time: "YYYY-MM-DD HH:MM:SS"
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let ts_format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    let timer = OffsetTime::new(offset, ts_format);
+    let fmt_layer = fmt::layer()
+        .with_target(false)
+        .with_level(true)
+        .with_timer(timer);
     let subscriber = Registry::default().with(env_filter).with(fmt_layer);
     tracing::subscriber::set_global_default(subscriber).ok();
 }
@@ -1266,6 +1275,7 @@ mod tests {
             log_resp_headers: false,
             log_redact: true,
             log_body_all: false,
+            log_json_body: false,
             cache_ttl: std::time::Duration::from_millis(2000),
             paths_info_cache_cap: 64,
             siblings_cache_cap: 64,
