@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 // In-memory sidecar cache
-pub type SidecarMap = HashMap<String, Value>; // rel_path (posix) -> entry
+pub type SidecarMap = std::sync::Arc<HashMap<String, Value>>; // rel_path (posix) -> entry (Arc for cheap clones)
 
 #[derive(Default)]
 pub struct SidecarCache {
@@ -24,8 +24,19 @@ pub struct SiblingsEntry {
     pub at: Instant,
 }
 
-pub static SIBLINGS_CACHE: once_cell::sync::Lazy<RwLock<HashMap<String, SiblingsEntry>>> =
-    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+pub struct SiblingsCache {
+    pub inner: HashMap<String, SiblingsEntry>,
+    pub evict_q: VecDeque<(String, Instant)>,
+}
+
+impl Default for SiblingsCache {
+    fn default() -> Self {
+        Self { inner: HashMap::new(), evict_q: VecDeque::new() }
+    }
+}
+
+pub static SIBLINGS_CACHE: once_cell::sync::Lazy<RwLock<SiblingsCache>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(SiblingsCache::default()));
 
 #[derive(Clone)]
 pub struct PathsInfoEntry {
@@ -33,8 +44,19 @@ pub struct PathsInfoEntry {
     pub at: Instant,
 }
 
-pub static PATHS_INFO_CACHE: once_cell::sync::Lazy<RwLock<HashMap<String, PathsInfoEntry>>> =
-    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+pub struct PathsInfoCache {
+    pub inner: HashMap<String, PathsInfoEntry>,
+    pub evict_q: VecDeque<(String, Instant)>,
+}
+
+impl Default for PathsInfoCache {
+    fn default() -> Self {
+        Self { inner: HashMap::new(), evict_q: VecDeque::new() }
+    }
+}
+
+pub static PATHS_INFO_CACHE: once_cell::sync::Lazy<RwLock<PathsInfoCache>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(PathsInfoCache::default()));
 
 #[derive(Clone)]
 pub struct Sha256Entry {
@@ -43,5 +65,17 @@ pub struct Sha256Entry {
 }
 
 pub type Sha256Key = (PathBuf, u64, u64);
-pub static SHA256_CACHE: once_cell::sync::Lazy<RwLock<HashMap<Sha256Key, Sha256Entry>>> =
-    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+
+pub struct Sha256Cache {
+    pub inner: HashMap<Sha256Key, Sha256Entry>,
+    pub evict_q: VecDeque<(Sha256Key, Instant)>,
+}
+
+impl Default for Sha256Cache {
+    fn default() -> Self {
+        Self { inner: HashMap::new(), evict_q: VecDeque::new() }
+    }
+}
+
+pub static SHA256_CACHE: once_cell::sync::Lazy<RwLock<Sha256Cache>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(Sha256Cache::default()));

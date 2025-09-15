@@ -10,7 +10,7 @@ use crate::caches::SidecarMap;
 pub async fn get_sidecar_map(base_dir: &Path) -> io::Result<SidecarMap> {
     let sidecar = base_dir.join(".paths-info.json");
     if !sidecar.is_file() {
-        return Ok(SidecarMap::new());
+        return Ok(Default::default());
     }
     let md = sidecar.metadata()?;
     let size = md.len();
@@ -33,7 +33,7 @@ pub async fn get_sidecar_map(base_dir: &Path) -> io::Result<SidecarMap> {
     }
     let data = fs::read_to_string(&sidecar).await?;
     let parsed: Value = serde_json::from_str(&data).unwrap_or(json!({}));
-    let mut map: SidecarMap = SidecarMap::new();
+    let mut map: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     if let Some(entries) = parsed.get("entries").and_then(|v| v.as_array()) {
         for it in entries {
             if it.get("type").and_then(|v| v.as_str()) == Some("file") {
@@ -44,8 +44,9 @@ pub async fn get_sidecar_map(base_dir: &Path) -> io::Result<SidecarMap> {
         }
     }
     let mut cache = crate::caches::SIDECAR_CACHE.write().await;
-    cache.inner.insert(key, map.clone());
-    Ok(map)
+    let arc_map: SidecarMap = std::sync::Arc::new(map);
+    cache.inner.insert(key, arc_map.clone());
+    Ok(arc_map)
 }
 
 // Extract an ETag string from a sidecar map for a given relative path, verifying size.

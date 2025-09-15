@@ -12,18 +12,33 @@ pub async fn collect_paths_info(
     base_dir: &Path,
     rel_prefix: Option<&str>,
 ) -> Result<Vec<Value>, super::super::Response> {
-    let base_abs = dunce::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+    // Caller passes canonical base_dir (from secure_join); avoid redundant canonicalize
+    let base_abs = base_dir.to_path_buf();
     let mut results: Vec<Value> = Vec::new();
     let sidecar_map = get_sidecar_map(&base_abs).await.unwrap_or_default();
 
     fn build_file_entry(abs_path: &Path, rel_path: &str, sidecar_map: &SidecarMap) -> Value {
         let rel_norm = rel_path.replace('\\', "/");
         if let Some(sc) = sidecar_map.get(&rel_norm) {
+            // Prefer sidecar-provided size (and lfs.size) to avoid extra filesystem metadata calls
+            // under load. Fall back to metadata if size is missing in sidecar.
+            let sidecar_size = sc
+                .get("size")
+                .and_then(|v| v.as_i64())
+                .or_else(|| {
+                    sc.get("lfs")
+                        .and_then(|v| v.get("size"))
+                        .and_then(|v| v.as_i64())
+                });
+            let size_i64 = match sidecar_size {
+                Some(s) if s >= 0 => s,
+                _ => file_size(abs_path).unwrap_or(0) as i64,
+            };
+
             let mut rec = serde_json::Map::new();
             rec.insert("path".to_string(), json!(rel_norm));
             rec.insert("type".to_string(), json!("file"));
-            let size = file_size(abs_path).unwrap_or(0);
-            rec.insert("size".to_string(), json!(size as i64));
+            rec.insert("size".to_string(), json!(size_i64));
             if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {
                 rec.insert("oid".to_string(), json!(oid));
             }
@@ -32,7 +47,12 @@ pub async fn collect_paths_info(
                 if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) {
                     ldict.insert("oid".to_string(), json!(loid));
                 }
-                ldict.insert("size".to_string(), json!(size as i64));
+                // Keep lfs.size consistent with top-level size if available; otherwise use sidecar value if present
+                let lfs_size = lfs
+                    .get("size")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(size_i64);
+                ldict.insert("size".to_string(), json!(lfs_size));
                 rec.insert("lfs".to_string(), Value::Object(ldict));
             }
             return Value::Object(rec);

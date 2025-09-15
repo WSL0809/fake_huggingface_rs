@@ -12,6 +12,7 @@ pub struct AppState {
     pub log_resp_headers: bool,
     pub log_redact: bool,
     pub log_body_all: bool,
+    pub log_json_body: bool,
     // cache options
     pub cache_ttl: Duration,
     pub paths_info_cache_cap: usize,

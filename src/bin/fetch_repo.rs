@@ -11,6 +11,11 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::time::Duration;
+use rayon::prelude::*;
+
+// Use mimalloc as the global allocator for the CLI binary
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Clone)]
 struct TreeItem {
@@ -557,45 +562,30 @@ fn write_paths_info_sidecar(
         return Ok(Some(sidecar_path));
     }
 
-    // Parallelize hashing across files. Keep memory bounded by per-thread 1MiB buffer in hash_file.
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let workers = std::cmp::max(1, std::cmp::min(threads, tasks.len()));
-    let chunk_size = (tasks.len() + workers - 1) / workers; // ceil div
-
-    let mut handles = Vec::with_capacity(workers);
-    for chunk in tasks.chunks(chunk_size) {
-        let chunk_vec: Vec<(PathBuf, bool)> = chunk.to_vec();
-        let root_clone = root_abs.clone();
-        handles.push(std::thread::spawn(move || -> Result<Vec<Value>, String> {
-            let mut out: Vec<Value> = Vec::with_capacity(chunk_vec.len());
-            for (abs_path, is_lfs) in chunk_vec {
-                // Prefer robust diff over strip_prefix to handle mixed absolute/relative roots
-                let rel_path = pathdiff::diff_paths(&abs_path, &root_clone).unwrap_or(abs_path.clone());
-                let rel = rel_path.to_string_lossy().replace('\\', "/");
-                let size = abs_path.metadata().map_err(|e| e.to_string())?.len();
-                let (sha1_hex, sha256_hex) = hash_file(&abs_path)?;
-                let mut rec = serde_json::Map::new();
-                rec.insert("path".to_string(), json!(rel));
-                rec.insert("type".to_string(), json!("file"));
-                rec.insert("size".to_string(), json!(size as i64));
-                rec.insert("oid".to_string(), json!(sha1_hex));
-                if is_lfs {
-                    rec.insert(
-                        "lfs".to_string(),
-                        json!({"oid": format!("sha256:{}", sha256_hex), "size": (size as i64)}),
-                    );
-                }
-                out.push(Value::Object(rec));
+    // Parallelize hashing across files with rayon.
+    // par_iter over slice preserves order, keeping output stable.
+    let entries: Vec<Value> = tasks
+        .par_iter()
+        .map(|(abs_path, is_lfs)| -> Result<Value, String> {
+            // Prefer robust diff over strip_prefix to handle mixed absolute/relative roots
+            let rel_path = pathdiff::diff_paths(abs_path, &root_abs).unwrap_or(abs_path.clone());
+            let rel = rel_path.to_string_lossy().replace('\\', "/");
+            let size = abs_path.metadata().map_err(|e| e.to_string())?.len();
+            let (sha1_hex, sha256_hex) = hash_file(abs_path)?;
+            let mut rec = serde_json::Map::new();
+            rec.insert("path".to_string(), json!(rel));
+            rec.insert("type".to_string(), json!("file"));
+            rec.insert("size".to_string(), json!(size as i64));
+            rec.insert("oid".to_string(), json!(sha1_hex));
+            if *is_lfs {
+                rec.insert(
+                    "lfs".to_string(),
+                    json!({"oid": format!("sha256:{}", sha256_hex), "size": (size as i64)}),
+                );
             }
-            Ok(out)
-        }));
-    }
-
-    let mut entries: Vec<Value> = Vec::with_capacity(tasks.len());
-    for h in handles {
-        let part = h.join().map_err(|_| "join worker thread".to_string())??;
-        entries.extend(part);
-    }
+            Ok(Value::Object(rec))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     ensure_dir(&root_abs)?;
     let obj = json!({"version": 1, "entries": entries});
