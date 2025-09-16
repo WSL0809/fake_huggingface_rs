@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use blake3::Hasher as Blake3Hasher;
 use clap::Parser;
 use glob::Pattern;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
@@ -522,11 +523,12 @@ fn write_random_file(p: &Path, size_bytes: u64, force: bool) -> Result<(), Strin
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<(String, String), String> {
+fn hash_file(path: &Path) -> Result<(String, String, String), String> {
     let mut f = File::open(path).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; 1024 * 1024];
     let mut h1 = Sha1::new();
     let mut h256: Sha256 = Sha2Digest::new();
+    let mut hb3 = Blake3Hasher::new();
     loop {
         let n = f.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {
@@ -534,8 +536,14 @@ fn hash_file(path: &Path) -> Result<(String, String), String> {
         }
         h1.update(&buf[..n]);
         h256.update(&buf[..n]);
+        hb3.update(&buf[..n]);
     }
-    Ok((hex::encode(h1.finalize()), hex::encode(h256.finalize())))
+    let blake3_hex = hex::encode(hb3.finalize().as_bytes());
+    Ok((
+        hex::encode(h1.finalize()),
+        hex::encode(h256.finalize()),
+        blake3_hex,
+    ))
 }
 
 fn write_paths_info_sidecar(
@@ -571,12 +579,13 @@ fn write_paths_info_sidecar(
             let rel_path = pathdiff::diff_paths(abs_path, &root_abs).unwrap_or(abs_path.clone());
             let rel = rel_path.to_string_lossy().replace('\\', "/");
             let size = abs_path.metadata().map_err(|e| e.to_string())?.len();
-            let (sha1_hex, sha256_hex) = hash_file(abs_path)?;
+            let (sha1_hex, sha256_hex, blake3_hex) = hash_file(abs_path)?;
             let mut rec = serde_json::Map::new();
             rec.insert("path".to_string(), json!(rel));
             rec.insert("type".to_string(), json!("file"));
             rec.insert("size".to_string(), json!(size as i64));
             rec.insert("oid".to_string(), json!(sha1_hex));
+            rec.insert("blake3".to_string(), json!(blake3_hex));
             if *is_lfs {
                 rec.insert(
                     "lfs".to_string(),

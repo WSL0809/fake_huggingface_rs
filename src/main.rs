@@ -24,9 +24,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod app_state;
 mod caches;
-mod utils;
 mod middleware;
 mod resolve;
+mod routes_blake3;
+mod utils;
 mod routes_models;
 mod routes_datasets;
 
@@ -100,6 +101,7 @@ async fn main() {
 
     // Build router
     let app = Router::new()
+        .route("/api/blake3/{*repo}", get(routes_blake3::get_repo_blake3))
         // Datasets catch-all under /api/datasets
         .route(
             "/api/datasets/{*rest}",

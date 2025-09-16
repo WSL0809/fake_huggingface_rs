@@ -45,6 +45,10 @@ API
   - `GET /api/datasets/{repo_id}/revision/{revision}`
   - `POST /api/datasets/{repo_id}/paths-info/{revision}`（在 `FAKE_HUB_ROOT/datasets/{repo_id}` 下）
   - `GET /api/datasets/{repo_id}/tree/{revision}`（返回数组；支持 `?recursive=1&expand=1`）
+- 仓库文件 BLAKE3 摘要
+  - `GET /api/blake3/{repo_id}`（`repo_id` 可含 org/name；若目标位于数据集命名空间，同样使用该路径）
+  - 返回：`{"relative/path": "<blake3 hex>", ...}`，按字典序排序
+  - 依赖 `.paths-info.json`；缺失时返回 500；旧 sidecar 不含 `blake3` 字段会在请求时补算
 - 文件下载/探测
   - `GET|HEAD /{repo_id}/resolve/{revision}/{filename...}`
   - GET 支持 Range（bytes=...）：返回 206/416；非法 Range 回退 200 全量。
@@ -84,7 +88,7 @@ paths-info 语义
 cargo run --bin fetch_repo -- -t model user/repo
 ```
 
-生成时会同时写入 `.paths-info.json` 侧车文件，供服务器在 HEAD/GET 请求中严格读取 ETag。
+生成时会同时写入 `.paths-info.json` 侧车文件（包含 `oid`、`sha256`、`blake3` 等），供服务器在 HEAD/GET/摘要查询中使用。
 
 参数（对齐 Python 原型）：
 - `-t, --repo-type model|dataset`（默认 `model`）
