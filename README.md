@@ -15,9 +15,10 @@ Rust 版 Fake HuggingFace 服务器（Axum）
 
 运行
 - 依赖：Rust 1.80+（Edition 2024）
-- 开发构建：`cd fake_huggingface_rs && cargo build`
-- 发布构建：`cd fake_huggingface_rs && cargo build --release`
-- 启动：`FAKE_HUB_ROOT=fake_hub ./target/release/fake_huggingface_rs`
+- 常用命令：`make build`（调试构建）、`make release`（发布构建）、`make fmt`、`make clippy`、`make test`、`make run`
+- 后台启动：`make start`（默认使用 `logs/server.log`、依赖 `scripts/start_server.sh`；可通过 `FAKE_HUB_ROOT`、`RUST_LOG` 覆写）
+- 手动构建：`cargo build` 或 `cargo build --release`
+- 手动启动：`FAKE_HUB_ROOT=fake_hub ./target/release/fake_huggingface_rs`
  - 启动输出：会打印绑定地址、本地与局域网可访问地址，例如：
    - `[fake-hub] Listening on http://0.0.0.0:8000 (local: http://127.0.0.1:8000, lan: http://192.168.1.23:8000)`
 
