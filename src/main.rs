@@ -1,48 +1,41 @@
 use std::collections::HashSet;
 use std::env;
 use std::hash::{Hash, Hasher};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use async_stream::stream;
-use axum::body::{Body, Bytes};
-use axum::extract::{Path as AxPath, Request as AxRequest, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::body::Bytes;
+use axum::extract::Request as AxRequest;
+use axum::http::{StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tracing::{error, info};
+ 
+use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 use tracing_subscriber::fmt::time::OffsetTime;
 use time::{macros::format_description, UtcOffset};
-use uuid::Uuid;
 
-// Use mimalloc as the global allocator for the server binary
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod app_state;
 mod caches;
 mod utils;
+mod middleware;
+mod resolve;
+mod routes_models;
+mod routes_datasets;
 
 use app_state::AppState;
-use caches::{
-    PATHS_INFO_CACHE, PathsInfoEntry, SHA256_CACHE, SIBLINGS_CACHE, Sha256Entry, SiblingsEntry,
-};
-use utils::fs_walk::{collect_paths_info, list_siblings_except_sidecar};
-use utils::headers::{file_headers_common, set_content_range};
-use utils::paths::{file_size, is_sidecar_path, normalize_join_abs, secure_join};
-use utils::sidecar::{etag_from_sidecar, get_sidecar_map};
-use utils::repo_json::{build_repo_json, RepoJsonFlavor, RepoKind};
+use caches::{PATHS_INFO_CACHE, PathsInfoEntry};
+// Only import what is used to avoid warnings
+use utils::sidecar::get_sidecar_map;
 
-const CHUNK_SIZE: usize = 262_144; // 256 KiB per read chunk
+pub(crate) const CHUNK_SIZE: usize = 262_144; // 256 KiB per read chunk
 
 #[tokio::main]
 async fn main() {
@@ -98,24 +91,29 @@ async fn main() {
             .unwrap_or(1024),
     };
 
-    println!("[fake-hub] FAKE_HUB_ROOT = {}", root_abs.display());
+    // Startup log (respect LOG_REDACT)
+    if state.log_redact {
+        info!(target: "fakehub", "[fake-hub] FAKE_HUB_ROOT configured (redacted)");
+    } else {
+        info!(target: "fakehub", "[fake-hub] FAKE_HUB_ROOT = {}", root_abs.display());
+    }
 
     // Build router
     let app = Router::new()
         // Datasets catch-all under /api/datasets
         .route(
             "/api/datasets/{*rest}",
-            get(get_dataset_catchall_get).post(get_dataset_paths_info_post),
+            get(routes_datasets::get_dataset_catchall_get).post(routes_datasets::get_dataset_paths_info_post),
         )
         // Models catch-all under /api/models
         .route(
             "/api/models/{*rest}",
-            get(get_model_catchall_get).post(get_model_paths_info_post),
+            get(routes_models::get_model_catchall_get).post(routes_models::get_model_paths_info_post),
         )
         // Resolve route fallback: GET and HEAD
-        .route("/{*rest}", get(resolve_catchall).head(resolve_catchall))
+        .route("/{*rest}", get(resolve::resolve_catchall).head(resolve::resolve_catchall))
         .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(state, log_requests_mw));
+        .layer(axum::middleware::from_fn_with_state(state, middleware::log_requests_mw));
 
     // Bind server
     let host = "0.0.0.0";
@@ -128,25 +126,19 @@ async fn main() {
     let loopback_url = format!("http://127.0.0.1:{port}");
     let lan_ip = local_ipv4_guess();
     match (bound, lan_ip) {
-        (Some(b), Some(ip)) => println!(
+        (Some(b), Some(ip)) => info!(target: "fakehub",
             "[fake-hub] Listening on http://{} (local: {}, lan: http://{}:{})",
-            b,
-            loopback_url,
-            ip,
-            port
+            b, loopback_url, ip, port
         ),
-        (Some(b), None) => println!(
+        (Some(b), None) => info!(target: "fakehub",
             "[fake-hub] Listening on http://{} (local: {})",
-            b,
-            loopback_url
+            b, loopback_url
         ),
-        (None, Some(ip)) => println!(
+        (None, Some(ip)) => info!(target: "fakehub",
             "[fake-hub] Listening (lan: http://{}:{}, local: {})",
-            ip,
-            port,
-            loopback_url
+            ip, port, loopback_url
         ),
-        _ => println!("[fake-hub] Listening on {host}:{port}"),
+        _ => info!(target: "fakehub", "[fake-hub] Listening on {host}:{port}"),
     }
     axum::serve(listener, app).await.expect("server run");
 }
@@ -190,457 +182,6 @@ fn local_ipv4_guess() -> Option<std::net::Ipv4Addr> {
     None
 }
 
-// ============ Middleware (request logging) ==========
-async fn log_requests_mw(
-    State(state): State<AppState>,
-    mut req: AxRequest,
-    next: axum::middleware::Next,
-) -> Response {
-    if !state.log_requests {
-        return next.run(req).await;
-    }
-
-    let req_id = Uuid::new_v4().to_string()[..12].to_string();
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    let headers = req.headers().clone();
-    let ct = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    // snapshot headers (all or minimal)
-    let mut hdr_map = serde_json::Map::new();
-    if state.log_headers_mode_all {
-        for (k, v) in headers.iter() {
-            let val = v.to_str().unwrap_or("");
-            hdr_map.insert(
-                k.to_string(),
-                json!(redact_header(k.as_str(), val, state.log_redact)),
-            );
-        }
-    } else {
-        let minimal = [
-            "user-agent",
-            "content-type",
-            "range",
-            "content-length",
-            "accept",
-            "referer",
-            "origin",
-        ];
-        for &k in &minimal {
-            if let Some(v) = headers.get(k) {
-                hdr_map.insert(
-                    k.to_string(),
-                    json!(redact_header(k, v.to_str().unwrap_or(""), state.log_redact)),
-                );
-            } else {
-                hdr_map.insert(k.to_string(), json!("-"));
-            }
-        }
-    }
-
-    // Optionally log JSON body, without consuming it for downstream handlers.
-    // Read the full body into memory, log a truncated snippet, and restore it.
-    let mut body_snippet: Option<String> = None;
-    let should_log_body = state.log_body_all
-        || (state.log_json_body && ct.to_ascii_lowercase().contains("application/json"));
-    if should_log_body {
-        // Skip reading huge bodies based on Content-Length to avoid unbounded memory.
-        let cl_opt = headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok());
-        let hard_skip_threshold = state.log_body_max.saturating_mul(4);
-        if matches!(cl_opt, Some(cl) if cl > hard_skip_threshold) {
-            body_snippet = Some(format!(
-                "<skipped large body: content-length={}>",
-                cl_opt.unwrap()
-            ));
-        } else {
-            let (parts, body) = req.into_parts();
-            // Read full body to preserve downstream semantics, but log truncated snippet only.
-            match axum::body::to_bytes(body, usize::MAX).await {
-                Ok(bytes) => {
-                    let slice_len = std::cmp::min(bytes.len(), state.log_body_max);
-                    if slice_len > 0 {
-                        let s = String::from_utf8_lossy(&bytes[..slice_len]).to_string();
-                        body_snippet = if !s.is_empty() { Some(s) } else { None };
-                    }
-                    req = AxRequest::from_parts(parts, Body::from(bytes));
-                }
-                Err(_) => {
-                    req = AxRequest::from_parts(parts, Body::empty());
-                }
-            }
-        }
-    }
-
-    info!(
-        target: "fakehub",
-        "[{}] HTTP {} {}",
-        req_id,
-        method,
-        uri,
-    );
-    info!(target: "fakehub", "[{}] Headers: {}", req_id, serde_json::to_string(&hdr_map).unwrap_or_default());
-    if let Some(ref s) = body_snippet {
-        info!(target: "fakehub", "[{}] Body[<= {}]: {}", req_id, state.log_body_max, s);
-    }
-
-    let started = std::time::Instant::now();
-    let mut resp = next.run(req).await;
-    let dur_ms = started.elapsed().as_millis();
-    let status = resp.status();
-    // attach X-Request-ID before logging to avoid borrow conflicts
-    let _ = resp.headers_mut().insert(
-        "X-Request-ID",
-        HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("-")),
-    );
-
-    // Re-read after mutation
-    let resp_ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
-    let resp_len = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
-
-    info!(
-        target: "fakehub",
-        "[{}] Response {} -> {} ({} ms) ct={} len={}",
-        req_id,
-        method,
-        status.as_u16(),
-        dur_ms,
-        resp_ct,
-        resp_len
-    );
-    if state.log_resp_headers {
-        let mut hdrs = serde_json::Map::new();
-        for (k, v) in resp.headers().iter() {
-            let val = v.to_str().unwrap_or("");
-            hdrs.insert(
-                k.to_string(),
-                json!(redact_header(k.as_str(), val, state.log_redact)),
-            );
-        }
-        info!(target: "fakehub", "[{}] Response headers: {}", req_id, serde_json::to_string(&hdrs).unwrap_or_default());
-    }
-
-    resp
-}
-
-fn redact_header(key: &str, val: &str, redact: bool) -> String {
-    if !redact {
-        return val.to_string();
-    }
-    let k = key.to_ascii_lowercase();
-    if [
-        "authorization",
-        "cookie",
-        "set-cookie",
-        "proxy-authorization",
-        "x-api-key",
-        "x-hf-token",
-    ]
-    .contains(&k.as_str())
-    {
-        "***".to_string()
-    } else {
-        val.to_string()
-    }
-}
-
-// ============ Models ============
-
-async fn get_model_catchall_get(
-    State(state): State<AppState>,
-    AxPath(rest): AxPath<String>,
-) -> impl IntoResponse {
-    // rest can be "{repo_id}" or "{repo_id}/revision/{revision}"
-    let parts: Vec<&str> = rest.split('/').collect();
-    // Support tree listing: /api/models/{repo_id}/tree/{revision}
-    if parts.len() >= 3 && parts[parts.len() - 2] == "tree" {
-        let _revision = parts.last().unwrap_or(&"");
-        let repo_id = parts[..parts.len() - 2].join("/");
-        let Some(repo_path) = secure_join(&state.root, &repo_id) else {
-            return http_not_found("Repository not found");
-        };
-        if !repo_path.is_dir() {
-            return http_not_found("Repository not found");
-        }
-        // Sidecar required: error if missing/incomplete
-        if let Some(vals) = utils::fs_walk::collect_paths_info_from_sidecar(&repo_path).await {
-            return Json(vals).into_response();
-        }
-        return http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete");
-    }
-    if parts.len() >= 3 && parts[parts.len() - 2] == "revision" {
-        let revision = parts.last().unwrap_or(&"");
-        let repo_id = parts[..parts.len() - 2].join("/");
-        match build_model_response(&state, &repo_id, Some(revision)).await {
-            Ok(val) => Json(val).into_response(),
-            Err(e) => e,
-        }
-    } else {
-        let repo_id = rest;
-        match build_model_response(&state, &repo_id, None).await {
-            Ok(val) => Json(val).into_response(),
-            Err(e) => e,
-        }
-    }
-}
-
-async fn get_model_paths_info_post(
-    State(state): State<AppState>,
-    AxPath(rest): AxPath<String>,
-    req: AxRequest,
-) -> impl IntoResponse {
-    // expect "{repo_id}/paths-info/{revision}"
-    let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() >= 3 && parts[parts.len() - 2] == "paths-info" {
-        let _revision = parts.last().unwrap_or(&"");
-        let repo_id = parts[..parts.len() - 2].join("/");
-        let Some(repo_path) = secure_join(&state.root, &repo_id) else {
-            return http_not_found("Repository not found");
-        };
-        if !repo_path.is_dir() {
-            return http_not_found("Repository not found");
-        }
-        match paths_info_response(&state, &repo_path, req).await {
-            Ok(vals) => Json(vals).into_response(),
-            Err(e) => e,
-        }
-    } else {
-        http_not_found("Not Found")
-    }
-}
-
-async fn build_model_response(
-    state: &AppState,
-    repo_id: &str,
-    revision: Option<&str>,
-) -> Result<Value, Response> {
-    let Some(repo_path) = secure_join(&state.root, repo_id) else {
-        return Err(http_not_found("Repository not found"));
-    };
-    if !repo_path.is_dir() {
-        return Err(http_not_found("Repository not found"));
-    }
-    // repo_path is canonical from secure_join; avoid redundant canonicalize
-    let cache_key = format!("model:{}", repo_path.display());
-    let now = Instant::now();
-    // Try cache
-    if let Some(hit) = {
-        let cache = SIBLINGS_CACHE.read().await;
-        cache.inner.get(&cache_key).cloned()
-    } {
-        if now.duration_since(hit.at) < state.cache_ttl {
-            // LRU refresh on hit
-            let fresh = Instant::now();
-            let mut cachew = SIBLINGS_CACHE.write().await;
-            if let Some(entry) = cachew.inner.get_mut(&cache_key) {
-                entry.at = fresh;
-                cachew.evict_q.push_back((cache_key.clone(), fresh));
-            }
-            let val = build_repo_json(
-                RepoKind::Model,
-                repo_id,
-                revision,
-                &hit.siblings,
-                hit.total,
-                RepoJsonFlavor::Rich,
-            );
-            return Ok(val);
-        }
-    }
-
-    // Sidecar required: compute siblings strictly from sidecar
-    let (siblings, total_size): (Vec<Value>, u64) =
-        if let Some((s, t)) = utils::fs_walk::siblings_from_sidecar(&repo_path).await {
-            (s, t)
-        } else {
-            return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete"));
-        };
-    // Insert to cache (bounded)
-    {
-        let mut cache = SIBLINGS_CACHE.write().await;
-        if cache.inner.len() >= state.siblings_cache_cap {
-            while let Some((old_k, old_at)) = cache.evict_q.pop_front() {
-                if let Some(entry) = cache.inner.get(&old_k) {
-                    if entry.at == old_at {
-                        cache.inner.remove(&old_k);
-                        break;
-                    }
-                }
-            }
-        }
-        cache.evict_q.push_back((cache_key.clone(), now));
-        cache.inner.insert(
-            cache_key,
-            SiblingsEntry { siblings: siblings.clone(), total: total_size, at: now },
-        );
-    }
-
-    let val = build_repo_json(
-        RepoKind::Model,
-        repo_id,
-        revision,
-        &siblings,
-        total_size,
-        RepoJsonFlavor::Minimal,
-    );
-    Ok(val)
-}
-
-// ============ Datasets ============
-async fn get_dataset_catchall_get(
-    State(state): State<AppState>,
-    AxPath(rest): AxPath<String>,
-) -> impl IntoResponse {
-    // rest can be "{repo_id}" or "{repo_id}/revision/{revision}"
-    let parts: Vec<&str> = rest.split('/').collect();
-    // Support tree listing: /api/datasets/{repo_id}/tree/{revision}
-    if parts.len() >= 3 && parts[parts.len() - 2] == "tree" {
-        let _revision = parts.last().unwrap_or(&"");
-        let repo_id = parts[..parts.len() - 2].join("/");
-        let ds_base = state.root.join("datasets");
-        let Some(ds_path) = secure_join(&ds_base, &repo_id) else {
-            return http_not_found("Dataset not found");
-        };
-        if !ds_path.is_dir() {
-            return http_not_found("Dataset not found");
-        }
-        if let Some(vals) = utils::fs_walk::collect_paths_info_from_sidecar(&ds_path).await {
-            return Json(vals).into_response();
-        }
-        return http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete");
-    }
-    if parts.len() >= 3 && parts[parts.len() - 2] == "revision" {
-        let revision = parts.last().unwrap_or(&"");
-        let repo_id = parts[..parts.len() - 2].join("/");
-        match build_dataset_response(&state, &repo_id, Some(revision)).await {
-            Ok(val) => Json(val).into_response(),
-            Err(e) => e,
-        }
-    } else {
-        let repo_id = rest;
-        match build_dataset_response(&state, &repo_id, None).await {
-            Ok(val) => Json(val).into_response(),
-            Err(e) => e,
-        }
-    }
-}
-
-async fn get_dataset_paths_info_post(
-    State(state): State<AppState>,
-    AxPath(rest): AxPath<String>,
-    req: AxRequest,
-) -> impl IntoResponse {
-    // expect "{repo_id}/paths-info/{revision}"
-    let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() >= 3 && parts[parts.len() - 2] == "paths-info" {
-        let _revision = parts.last().unwrap_or(&"");
-        let repo_id = parts[..parts.len() - 2].join("/");
-        let ds_base = state.root.join("datasets");
-        let Some(ds_path) = secure_join(&ds_base, &repo_id) else {
-            return http_not_found("Dataset not found");
-        };
-        if !ds_path.is_dir() {
-            return http_not_found("Dataset not found");
-        }
-        match paths_info_response(&state, &ds_path, req).await {
-            Ok(vals) => Json(vals).into_response(),
-            Err(e) => e,
-        }
-    } else {
-        http_not_found("Not Found")
-    }
-}
-
-async fn build_dataset_response(
-    state: &AppState,
-    repo_id: &str,
-    revision: Option<&str>,
-) -> Result<Value, Response> {
-    let ds_base = state.root.join("datasets");
-    let Some(ds_path) = secure_join(&ds_base, repo_id) else {
-        return Err(http_not_found("Dataset not found"));
-    };
-    if !ds_path.is_dir() {
-        return Err(http_not_found("Dataset not found"));
-    }
-    // ds_path is canonical from secure_join; avoid redundant canonicalize
-    let cache_key = format!("dataset:{}", ds_path.display());
-    let now = Instant::now();
-    if let Some(hit) = {
-        let cache = SIBLINGS_CACHE.read().await;
-        cache.inner.get(&cache_key).cloned()
-    } {
-        if now.duration_since(hit.at) < state.cache_ttl {
-            let fresh = Instant::now();
-            let mut cachew = SIBLINGS_CACHE.write().await;
-            if let Some(entry) = cachew.inner.get_mut(&cache_key) {
-                entry.at = fresh;
-                cachew.evict_q.push_back((cache_key.clone(), fresh));
-            }
-            let val = build_repo_json(
-                RepoKind::Dataset,
-                repo_id,
-                revision,
-                &hit.siblings,
-                hit.total,
-                RepoJsonFlavor::Minimal,
-            );
-            return Ok(val);
-        }
-    }
-
-    let (siblings, total_size): (Vec<Value>, u64) =
-        if let Some((s, t)) = utils::fs_walk::siblings_from_sidecar(&ds_path).await {
-            (s, t)
-        } else {
-            return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete"));
-        };
-    {
-        let mut cache = SIBLINGS_CACHE.write().await;
-        if cache.inner.len() >= state.siblings_cache_cap {
-            while let Some((old_k, old_at)) = cache.evict_q.pop_front() {
-                if let Some(entry) = cache.inner.get(&old_k) {
-                    if entry.at == old_at {
-                        cache.inner.remove(&old_k);
-                        break;
-                    }
-                }
-            }
-        }
-        cache.evict_q.push_back((cache_key.clone(), now));
-        cache.inner.insert(
-            cache_key,
-            SiblingsEntry { siblings: siblings.clone(), total: total_size, at: now },
-        );
-    }
-
-    let val = build_repo_json(
-        RepoKind::Dataset,
-        repo_id,
-        revision,
-        &siblings,
-        total_size,
-        RepoJsonFlavor::Rich,
-    );
-    Ok(val)
-}
-
-// ============ paths-info (shared) ============
-
 #[derive(Debug, Deserialize)]
 struct PathsInfoBody {
     #[serde(default)]
@@ -649,7 +190,7 @@ struct PathsInfoBody {
     expand: Option<bool>,
 }
 
-async fn paths_info_response(
+pub(crate) async fn paths_info_response(
     state: &AppState,
     base_dir: &Path,
     req: AxRequest,
@@ -849,465 +390,13 @@ async fn paths_info_response(
     Ok(unique)
 }
 
-// (old POST sha256 removed; GET-only implemented in catchall)
-
-// collect_paths_info moved to utils::fs_walk
-
-// Compute sha256 with TTL cache keyed by (path, mtime, size)
-async fn sha256_file_cached(state: &AppState, p: &Path) -> io::Result<String> {
-    let md = p.metadata()?;
-    let size = md.len();
-    let mtime = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // p is canonical at call sites; avoid redundant canonicalize for cache key
-    let key = (p.to_path_buf(), mtime, size);
-    if let Some(hit) = {
-        let cache = SHA256_CACHE.read().await;
-        cache.inner.get(&key).cloned()
-    } {
-        if Instant::now().duration_since(hit.at) < state.cache_ttl {
-            let fresh = Instant::now();
-            let mut cachew = SHA256_CACHE.write().await;
-            let cloned = if let Some(entry) = cachew.inner.get_mut(&key) {
-                entry.at = fresh;
-                Some(entry.sum.clone())
-            } else { None };
-            cachew.evict_q.push_back((key.clone(), fresh));
-            if let Some(sum) = cloned { return Ok(sum); }
-            return Ok(hit.sum);
-        }
-    }
-    let mut file = tokio::fs::File::open(p).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let sum = hex::encode(hasher.finalize());
-    {
-        let mut cache = SHA256_CACHE.write().await;
-        if cache.inner.len() >= state.sha256_cache_cap {
-            while let Some((old_k, old_at)) = cache.evict_q.pop_front() {
-                if let Some(entry) = cache.inner.get(&old_k) {
-                    if entry.at == old_at { cache.inner.remove(&old_k); break; }
-                }
-            }
-        }
-        let now_i = Instant::now();
-        cache.evict_q.push_back((key.clone(), now_i));
-        cache.inner.insert(key, Sha256Entry { sum: sum.clone(), at: now_i });
-    }
-    Ok(sum)
-}
-
-// ============ Resolve (GET/HEAD) ============
-async fn resolve_catchall(
-    State(state): State<AppState>,
-    AxPath(rest): AxPath<String>,
-    req: AxRequest,
-) -> impl IntoResponse {
-    // Two patterns supported:
-    // - /{repo_id}/resolve/{revision}/{filename...} (GET|HEAD)
-    // - /{repo_id}/sha256/{revision}/{filename...} (GET only)
-    let path = if rest.starts_with('/') {
-        rest.clone()
-    } else {
-        format!("/{rest}")
-    };
-
-    // First, handle /sha256/
-    if let Some(idx) = path.rfind("/sha256/") {
-        let left = &path[1..idx];
-        let right = &path[(idx + "/sha256/".len())..];
-        let mut right_parts = right.splitn(2, '/');
-        let _revision = right_parts.next().unwrap_or("");
-        let filename = right_parts.next().unwrap_or("");
-        if left.is_empty() || filename.is_empty() {
-            return http_not_found("Not Found");
-        }
-        if req.method() == Method::HEAD {
-            return http_error(StatusCode::METHOD_NOT_ALLOWED, "Use GET for sha256");
-        }
-        if is_sidecar_path(filename) {
-            return http_not_found("File not found");
-        }
-        let rel = format!("{}/{}", left.trim_start_matches('/'), filename);
-        let Some(filepath) = secure_join(&state.root, &rel) else {
-            return http_not_found("File not found");
-        };
-        if !filepath.is_file() {
-            return http_not_found("File not found");
-        }
-        match sha256_file_cached(&state, &filepath).await {
-            Ok(sum) => {
-                let body = json!({ "sha256": sum });
-                return (StatusCode::OK, Json(body)).into_response();
-            }
-            Err(_) => return http_error(StatusCode::INTERNAL_SERVER_ERROR, "Hash compute failed"),
-        }
-    }
-
-    // Otherwise, treat as /resolve/
-    // Expect pattern: /{repo_id}/resolve/{revision}/{filename...}
-    // We'll find the last occurrence of "/resolve/" and split.
-    let needle = "/resolve/";
-    let Some(idx) = path.rfind(needle) else {
-        return http_not_found("Not Found");
-    };
-    let left = &path[1..idx]; // skip leading '/'
-    let right = &path[(idx + needle.len())..];
-    // right = {revision}/{filename...}
-    let mut right_parts = right.splitn(2, '/');
-    let revision = right_parts.next().unwrap_or("");
-    let filename = right_parts.next().unwrap_or("");
-    if left.is_empty() || revision.is_empty() || filename.is_empty() {
-        return http_not_found("Not Found");
-    }
-
-    // .paths-info.json cannot be served as file
-    if is_sidecar_path(filename) {
-        return http_not_found("File not found");
-    }
-
-    let rel = format!("{}/{}", left.trim_start_matches('/'), filename);
-    let Some(filepath) = secure_join(&state.root, &rel) else {
-        return http_not_found("File not found");
-    };
-    if !filepath.is_file() {
-        return http_not_found("File not found");
-    }
-
-    if req.method() == Method::HEAD {
-        return head_file(&state, left, revision, filename, &filepath).await;
-    }
-    // GET with Range
-    let range_header = req
-        .headers()
-        .get("range")
-        .or_else(|| req.headers().get("Range"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    if let Some(rh) = range_header {
-        let total = match fs::metadata(&filepath).await { Ok(m) => m.len(), Err(_) => 0 };
-        match parse_range(&rh, total) {
-            RangeParse::Invalid => {
-                // ignore range, return full file
-                return full_file_response(&state, left, revision, filename, &filepath).await;
-            }
-            RangeParse::Unsatisfiable => {
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    "Content-Range",
-                    HeaderValue::from_str(&format!("bytes */{total}")).unwrap(),
-                );
-                headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-                return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
-            }
-            RangeParse::Ok(start, end) => {
-                let length = end - start + 1;
-                let fp_for_stream = filepath.clone();
-                let stream = stream! {
-                    let mut f = match fs::File::open(&fp_for_stream).await { Ok(f) => f, Err(e) => { error!("open file: {}", e); yield Err(io::Error::other("open failed")); return; } };
-                    if let Err(e) = f.seek(std::io::SeekFrom::Start(start)).await { error!("seek: {}", e); yield Err(io::Error::other("seek failed")); return; }
-                    let mut remaining = length as usize;
-                    let mut buf = vec![0u8; CHUNK_SIZE];
-                    while remaining > 0 {
-                        let cap = std::cmp::min(buf.len(), remaining);
-                        match f.read(&mut buf[..cap]).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                yield Ok::<Bytes, io::Error>(Bytes::copy_from_slice(&buf[..n]));
-                                remaining -= n;
-                            }
-                            Err(e) => { error!("read: {}", e); break; }
-                        }
-                    }
-                };
-                let mut headers = file_headers_common(revision, length);
-                // Strict ETag from sidecar; otherwise 500
-                let mut repo_root = filepath.to_path_buf();
-                let depth = filename.split('/').count();
-                for _ in 0..depth { if let Some(parent) = repo_root.parent() { repo_root = parent.to_path_buf(); } }
-                let sc_map = get_sidecar_map(&repo_root).await.unwrap_or_default();
-                let rel_path = filename.replace('\\', "/");
-                let etag_pair = etag_from_sidecar(&sc_map, &rel_path, total);
-                if etag_pair.is_none() {
-                    error!("ETag missing for range {}@{}:{}", left, revision, rel_path);
-                    return http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available");
-                }
-                let (etag, is_lfs) = etag_pair.unwrap();
-                let quoted = format!("\"{etag}\"");
-                headers.insert("ETag", HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")));
-                if is_lfs { headers.insert("x-lfs-size", HeaderValue::from_str(&total.to_string()).unwrap()); }
-                set_content_range(&mut headers, start, end, total);
-                let body = Body::from_stream(stream);
-                return Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .body(body)
-                    .map(|mut r| {
-                        *r.headers_mut() = headers;
-                        r
-                    })
-                    .unwrap()
-                    .into_response();
-            }
-        }
-    }
-
-    full_file_response(&state, left, revision, filename, &filepath).await
-}
-
-async fn full_file_response(
-    _state: &AppState,
-    repo_id: &str,
-    revision: &str,
-    filename: &str,
-    path: &Path,
-) -> Response {
-    // Read entire file into body stream using tokio_util::io::ReaderStream if desired.
-    // For simplicity and parity, we use a streaming reader.
-    let file = match fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return http_not_found("File not found"),
-    };
-    let size = file.metadata().await.ok().map(|m| m.len()).unwrap_or(0);
-    let stream = tokio_util::io::ReaderStream::with_capacity(file, CHUNK_SIZE);
-    let mut headers = file_headers_common(revision, size);
-    // Strict ETag for GET: require from sidecar; otherwise 500
-    {
-        let mut repo_root = path.to_path_buf();
-        let depth = filename.split('/').count();
-        for _ in 0..depth { if let Some(parent) = repo_root.parent() { repo_root = parent.to_path_buf(); } }
-        let sc_map = get_sidecar_map(&repo_root).await.unwrap_or_default();
-        let rel_path = filename.replace('\\', "/");
-        let etag_pair = etag_from_sidecar(&sc_map, &rel_path, size);
-        if etag_pair.is_none() {
-            error!("ETag missing for {}@{}:{}", repo_id, revision, rel_path);
-            return http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available");
-        }
-        let (etag, is_lfs) = etag_pair.unwrap();
-        let quoted = format!("\"{etag}\"");
-        headers.insert("ETag", HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")));
-        if is_lfs { headers.insert("x-lfs-size", HeaderValue::from_str(&size.to_string()).unwrap()); }
-    }
-    let body = Body::from_stream(stream);
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(body)
-        .map(|mut r| {
-            for (k, v) in headers.iter() {
-                r.headers_mut().insert(k, v.clone());
-            }
-            r
-        })
-        .unwrap()
-}
-
-async fn head_file(
-    _state: &AppState,
-    repo_id: &str,
-    revision: &str,
-    filename: &str,
-    filepath: &Path,
-) -> Response {
-    let size = match fs::metadata(filepath).await { Ok(m) => m.len(), Err(_) => 0 };
-    let mut headers = file_headers_common(revision, size);
-
-    // ETag strictly from sidecar; otherwise 500
-    // Derive repo_root by walking up from the filepath to avoid extra canonicalize.
-    let mut repo_root = filepath.to_path_buf();
-    let depth = filename.split('/').count();
-    for _ in 0..depth {
-        if let Some(parent) = repo_root.parent() { repo_root = parent.to_path_buf(); }
-    }
-    let rel_path = filename.replace('\\', "/");
-    let sc_map = get_sidecar_map(&repo_root).await.unwrap_or_default();
-    let etag_pair = etag_from_sidecar(&sc_map, &rel_path, size);
-    if etag_pair.is_none() {
-        error!("ETag missing for {}@{}:{}", repo_id, revision, rel_path);
-        return http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available");
-    }
-    let (etag, is_lfs) = etag_pair.unwrap();
-    let quoted = format!("\"{etag}\"");
-    headers.insert(
-        "ETag",
-        HeaderValue::from_str(&quoted).unwrap_or(HeaderValue::from_static("\"-\"")),
-    );
-    if is_lfs {
-        headers.insert(
-            "x-lfs-size",
-            HeaderValue::from_str(&size.to_string()).unwrap(),
-        );
-    }
-    (StatusCode::OK, headers).into_response()
-}
-
-enum RangeParse {
-    Invalid,
-    Unsatisfiable,
-    Ok(u64, u64),
-}
-
-fn parse_range(h: &str, total: u64) -> RangeParse {
-    let s = h.trim();
-    let mut it = s.splitn(2, '=');
-    let unit = it.next().unwrap_or("");
-    let rest = it.next().unwrap_or("");
-    if !unit.eq_ignore_ascii_case("bytes") {
-        return RangeParse::Invalid;
-    }
-    let first = rest.split(',').next().unwrap_or("").trim();
-    if !first.contains('-') {
-        return RangeParse::Invalid;
-    }
-    let mut ab = first.splitn(2, '-');
-    let a = ab.next().unwrap_or("");
-    let b = ab.next().unwrap_or("");
-    if a.is_empty() {
-        // suffix: bytes=-N
-        let Ok(n) = b.parse::<u64>() else {
-            return RangeParse::Invalid;
-        };
-        if n == 0 {
-            return RangeParse::Invalid;
-        }
-        let start = total.saturating_sub(n);
-        let end = if total > 0 { total - 1 } else { 0 };
-        RangeParse::Ok(start, end)
-    } else {
-        let Ok(start) = a.parse::<u64>() else {
-            return RangeParse::Invalid;
-        };
-        let mut end = if b.is_empty() {
-            total.saturating_sub(1)
-        } else {
-            match b.parse::<u64>() {
-                Ok(v) => v,
-                Err(_) => return RangeParse::Invalid,
-            }
-        };
-        if start >= total {
-            return RangeParse::Unsatisfiable;
-        }
-        if end >= total {
-            end = total.saturating_sub(1);
-        }
-        if end < start {
-            return RangeParse::Unsatisfiable;
-        }
-        RangeParse::Ok(start, end)
-    }
-}
-
 // ============ Helpers ============
-fn http_not_found(msg: &str) -> Response {
+pub(crate) fn http_not_found(msg: &str) -> Response {
     let body = json!({"detail": msg});
     (StatusCode::NOT_FOUND, Json(body)).into_response()
 }
 
-fn http_error(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn http_error(status: StatusCode, msg: &str) -> Response {
     let body = json!({"detail": msg});
     (status, Json(body)).into_response()
-}
-
-// helpers moved to utils::{paths,sidecar,fs_walk}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_range;
-    use super::*;
-    use axum::routing::get;
-    use axum::Router;
-    use std::sync::Arc;
-    use tower::util::ServiceExt;
-
-    #[test]
-    fn parse_range_happy_paths() {
-        use super::RangeParse;
-        assert!(matches!(parse_range("bytes=0-0", 10), RangeParse::Ok(0, 0)));
-        assert!(matches!(parse_range("bytes=5-9", 10), RangeParse::Ok(5, 9)));
-        assert!(matches!(parse_range("bytes=5-", 10), RangeParse::Ok(5, 9)));
-        assert!(matches!(parse_range("bytes=-3", 10), RangeParse::Ok(7, 9)));
-    }
-
-    #[test]
-    fn parse_range_bad_cases() {
-        use super::RangeParse;
-        assert!(matches!(parse_range("bits=0-1", 10), RangeParse::Invalid));
-        assert!(matches!(parse_range("bytes=10-10", 10), RangeParse::Unsatisfiable));
-        assert!(matches!(parse_range("bytes=0-1000", 100), RangeParse::Ok(0, 99)));
-    }
-
-    #[tokio::test]
-    async fn router_head_get_with_etag() {
-        // Arrange a tiny repo under fake_hub/tests_repo_etag
-        let root = dunce::canonicalize("fake_hub").unwrap_or_else(|_| std::path::PathBuf::from("fake_hub"));
-        let repo_id = "tests_repo_etag";
-        let repo_dir = root.join(repo_id);
-        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
-        let file_path = repo_dir.join("x.bin");
-        tokio::fs::write(&file_path, b"hello").await.unwrap();
-        let size = file_path.metadata().unwrap().len();
-        let sidecar = repo_dir.join(".paths-info.json");
-        let sc = serde_json::json!({
-            "entries": [{
-                "path": "x.bin", "type": "file", "size": size as i64,
-                "lfs": {"oid": "sha256:1234", "size": size as i64}
-            }]
-        });
-        tokio::fs::write(&sidecar, serde_json::to_vec(&sc).unwrap()).await.unwrap();
-
-        // Build router with only resolve route
-        let state = AppState {
-            root: Arc::new(root.clone()),
-            log_requests: false,
-            log_body_max: 1024,
-            log_headers_mode_all: false,
-            log_resp_headers: false,
-            log_redact: true,
-            log_body_all: false,
-            log_json_body: false,
-            cache_ttl: std::time::Duration::from_millis(2000),
-            paths_info_cache_cap: 64,
-            siblings_cache_cap: 64,
-            sha256_cache_cap: 64,
-        };
-        let app = Router::new()
-            .route("/{*rest}", get(resolve_catchall).head(resolve_catchall))
-            .with_state(state);
-
-        // HEAD should return ETag from sidecar (1234)
-        let uri = format!("/{repo_id}/resolve/main/x.bin");
-        let resp = app
-            .clone()
-            .oneshot(axum::http::Request::builder().method("HEAD").uri(&uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let etag = resp.headers().get("ETag").unwrap().to_str().unwrap();
-        assert_eq!(etag, "\"1234\"");
-        assert!(resp.headers().get("Accept-Ranges").is_some());
-
-        // GET with range
-        let req = axum::http::Request::builder()
-            .method("GET")
-            .uri(&uri)
-            .header("Range", "bytes=0-1")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        let cr = resp.headers().get("Content-Range").unwrap().to_str().unwrap();
-        assert!(cr.starts_with("bytes 0-1/"));
-        assert!(resp.headers().get("Accept-Ranges").is_some());
-    }
 }
