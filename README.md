@@ -4,9 +4,14 @@ Rust 版 Fake HuggingFace 服务器（Axum）
 - 技术：Axum + Tokio，按需读取、分块传输，TTL 内存缓存（以空间换时间）。
 
 架构
-- `main.rs`：入口，挂载路由。
-- `app_state.rs`：保存配置。
-- `caches.rs`：缓存结构。
+- `src/main.rs`：入口与路由装配、初始化 tracing（打印监听地址，尊重 LOG_REDACT）。
+- `src/middleware.rs`：请求日志中间件（可选记录请求体，脱敏敏感头）。
+- `src/resolve.rs`：文件 GET/HEAD/Range 与响应构建；ETag 严格来自 sidecar，无回退；单文件 sha256。
+- `src/routes_models.rs`：模型相关 API 处理函数。
+- `src/routes_datasets.rs`：数据集相关 API 处理函数。
+- `src/app_state.rs`：运行时配置与环境变量解析。
+- `src/caches.rs`：TTL/容量受限的轻量缓存。
+- `src/utils/`：headers 构造、路径安全拼接、sidecar/树信息解析、repo_json 生成、目录遍历等。
 
 运行
 - 依赖：Rust 1.80+（Edition 2024）
@@ -18,7 +23,10 @@ Rust 版 Fake HuggingFace 服务器（Axum）
 
 环境变量
 - `FAKE_HUB_ROOT`：本地“仓库根目录”（默认 `fake_hub`）。数据集位于 `fake_hub/datasets/...`。
-- 日志：`LOG_REQUESTS`、`LOG_BODY_MAX`、`LOG_HEADERS=all|minimal`、`LOG_RESP_HEADERS`、`LOG_REDACT`、`LOG_BODY_ALL`。
+- 日志：`LOG_REQUESTS`、`LOG_BODY_MAX`、`LOG_HEADERS=all|minimal`、`LOG_RESP_HEADERS`、`LOG_REDACT`、`LOG_BODY_ALL`、`LOG_JSON_BODY`。
+  - 仅当 `LOG_BODY_ALL=1` 或 `LOG_JSON_BODY=1 且 Content-Type: application/json` 时尝试记录请求体；
+  - 仅在请求头存在 `Content-Length` 且大小不超过 `4*LOG_BODY_MAX` 时读取（否则跳过以避免 OOM）；
+  - 记录的正文内容按 `LOG_BODY_MAX` 截断；敏感头在 `LOG_REDACT=1` 时会脱敏。
 - 缓存：`CACHE_TTL_MS`（默认 2000ms）、`PATHS_INFO_CACHE_CAP`（默认 512）、`SIBLINGS_CACHE_CAP`（默认 256）、`SHA256_CACHE_CAP`（默认 1024）。
 - 远端配置与凭据（给 `fetch_repo` 工具用）：
   - `HF_REMOTE_ENDPOINT`（默认 `https://huggingface.co`）
@@ -39,7 +47,7 @@ API
 - 文件下载/探测
   - `GET|HEAD /{repo_id}/resolve/{revision}/{filename...}`
   - GET 支持 Range（bytes=...）：返回 206/416；非法 Range 回退 200 全量。
-  - HEAD：ETag 仅从 `.paths-info.json` 读取（LFS 文件用 `lfs.oid`，普通文件用 `oid`），不存在则 500；带 LFS 元数据的文件附带 `x-lfs-size`。
+  - HEAD：ETag 仅从 `.paths-info.json` 读取（LFS 文件用 `lfs.oid`，普通文件用 `oid`），不存在则 500（严格，不做回退）；带 LFS 元数据的文件附带 `x-lfs-size`；`416` 时包含 `Content-Length: 0`。
 - 新增：单文件 SHA-256
   - `GET /{repo_id}/sha256/{revision}/{filename...}`
   - 仅 GET；HEAD 返回 405。
@@ -75,7 +83,7 @@ paths-info 语义
 cargo run --bin fetch_repo -- -t model user/repo
 ```
 
-生成时会同时写入 `.paths-info.json` 侧车文件，供服务器在 HEAD 请求中读取 ETag。
+生成时会同时写入 `.paths-info.json` 侧车文件，供服务器在 HEAD/GET 请求中严格读取 ETag。
 
 参数（对齐 Python 原型）：
 - `-t, --repo-type model|dataset`（默认 `model`）
@@ -99,7 +107,7 @@ cargo run --bin fetch_repo -- -t model user/repo
 实现细节：
 - 通过 `GET /api/{models|datasets}/{repo}/tree/{rev}?recursive=1&expand=1` 获取文件列表；必要时携带 Bearer Token。
 - `repo_id` 每个路径段会做 URL 安全转码；即使传入已编码的 `HunyuanImage%2D2%2E1` 也会先解码再正确编码，避免二次编码。
-- 本地实际写入的文件用于计算 `.paths-info.json`（含 sha1 与 sha256），与服务器 HEAD ETag 逻辑一致（LFS 文件使用 `lfs.oid` 形如 `sha256:<hex>`，普通文件使用 `oid`）。
+- 本地实际写入的文件用于计算 `.paths-info.json`（含 sha1 与 sha256），与服务器 ETag 逻辑一致（LFS 使用 `lfs.oid` 形如 `sha256:<hex>`，普通文件使用 `oid`）。
 - 生成 `.paths-info.json` 时对文件哈希进行并行计算：按 CPU 并发切片，单线程仅占用 ~1MiB 缓冲，提升大型仓库生成速度。
 - 默认遵循系统代理（`HTTP(S)_PROXY`/`ALL_PROXY`）；如需显式忽略代理，使用 `--no-proxy`。
 - 远端错误会打印状态码与响应体，便于定位鉴权/修订问题。
@@ -118,3 +126,13 @@ cargo run --bin fetch_repo -- -t model user/repo
 cargo run --bin fetch_repo -- user/repo -t model --gen-count 100 --gen-avg-size 16MiB
 # 简单模式文件内容为随机字节；不可与 --fill-content 同用
 ```
+
+开发与测试
+-----------
+- 格式/Lint：`cargo fmt --all && cargo clippy --all-targets -- -D warnings`
+- 单元测试：`cargo test`（无网络；集成测试可基于 `tower::ServiceExt::oneshot`）
+- 关键模块：
+  - `middleware.rs`：请求日志/脱敏；
+  - `resolve.rs`：文件响应、Range 处理、严格 ETag；
+  - `routes_models.rs` / `routes_datasets.rs`：业务 handlers；
+  - `utils/`：公用工具与 sidecar 解析。
