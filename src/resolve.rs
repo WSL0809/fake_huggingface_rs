@@ -429,6 +429,8 @@ mod tests {
             log_redact: true,
             log_body_all: false,
             log_json_body: false,
+            ip_log_retention_secs: 1_800,
+            ip_log_per_ip_cap: 200,
             cache_ttl: std::time::Duration::from_millis(2000),
             paths_info_cache_cap: 64,
             siblings_cache_cap: 64,

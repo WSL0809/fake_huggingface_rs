@@ -1,12 +1,18 @@
-use axum::body::{Body};
+use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::body::Body;
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Request as AxRequest, State};
 use axum::http::HeaderValue;
 use axum::response::Response;
-use serde_json::{json};
+use serde_json::json;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::caches::{IP_LOG, IpAccessEntry, prune_ip_bucket};
 
 // Request logging middleware with safe body handling and header redaction.
 pub(crate) async fn log_requests_mw(
@@ -21,6 +27,10 @@ pub(crate) async fn log_requests_mw(
     let req_id = Uuid::new_v4().to_string()[..12].to_string();
     let method = req.method().clone();
     let uri = req.uri().clone();
+    let connect_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0);
     let headers = req.headers().clone();
     let ct = headers
         .get("content-type")
@@ -88,7 +98,9 @@ pub(crate) async fn log_requests_mw(
                         let slice_len = std::cmp::min(bytes.len(), state.log_body_max);
                         if slice_len > 0 {
                             let s = String::from_utf8_lossy(&bytes[..slice_len]).to_string();
-                            if !s.is_empty() { body_snippet = Some(s); }
+                            if !s.is_empty() {
+                                body_snippet = Some(s);
+                            }
                         }
                         req = AxRequest::from_parts(parts, Body::from(bytes));
                     }
@@ -156,6 +168,34 @@ pub(crate) async fn log_requests_mw(
         info!(target: "fakehub", "[{}] Response headers: {}", req_id, serde_json::to_string(&hdrs).unwrap_or_default());
     }
 
+    if let Some(ip_key) = extract_client_ip(&headers, connect_ip) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let path = uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| uri.path().to_string());
+        let retention_ms_u64 = state.ip_log_retention_secs.saturating_mul(1000);
+        let retention_ms = std::cmp::min(retention_ms_u64, i64::MAX as u64) as i64;
+        let per_ip_cap = state.ip_log_per_ip_cap;
+        let mut map = IP_LOG.write().await;
+        let bucket = map.entry(ip_key).or_insert_with(VecDeque::new);
+        prune_ip_bucket(bucket, now_ms, retention_ms);
+        if bucket.len() >= per_ip_cap {
+            while bucket.len() >= per_ip_cap {
+                bucket.pop_front();
+            }
+        }
+        bucket.push_back(IpAccessEntry {
+            at_ms: now_ms,
+            method: method.to_string(),
+            path,
+            status: status.as_u16(),
+        });
+    }
+
     resp
 }
 
@@ -180,3 +220,23 @@ fn redact_header(key: &str, val: &str, redact: bool) -> String {
     }
 }
 
+fn extract_client_ip(
+    headers: &axum::http::HeaderMap,
+    connect: Option<SocketAddr>,
+) -> Option<String> {
+    if let Some(val) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        for part in val.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(val) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    connect.map(|addr| addr.ip().to_string())
+}

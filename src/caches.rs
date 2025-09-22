@@ -31,7 +31,10 @@ pub struct SiblingsCache {
 
 impl Default for SiblingsCache {
     fn default() -> Self {
-        Self { inner: HashMap::new(), evict_q: VecDeque::new() }
+        Self {
+            inner: HashMap::new(),
+            evict_q: VecDeque::new(),
+        }
     }
 }
 
@@ -51,7 +54,10 @@ pub struct PathsInfoCache {
 
 impl Default for PathsInfoCache {
     fn default() -> Self {
-        Self { inner: HashMap::new(), evict_q: VecDeque::new() }
+        Self {
+            inner: HashMap::new(),
+            evict_q: VecDeque::new(),
+        }
     }
 }
 
@@ -73,9 +79,38 @@ pub struct Sha256Cache {
 
 impl Default for Sha256Cache {
     fn default() -> Self {
-        Self { inner: HashMap::new(), evict_q: VecDeque::new() }
+        Self {
+            inner: HashMap::new(),
+            evict_q: VecDeque::new(),
+        }
     }
 }
 
 pub static SHA256_CACHE: once_cell::sync::Lazy<RwLock<Sha256Cache>> =
     once_cell::sync::Lazy::new(|| RwLock::new(Sha256Cache::default()));
+
+#[derive(Clone)]
+pub struct IpAccessEntry {
+    pub at_ms: i64,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+}
+
+pub type IpAccessMap = HashMap<String, VecDeque<IpAccessEntry>>;
+
+pub static IP_LOG: once_cell::sync::Lazy<RwLock<IpAccessMap>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+
+pub fn prune_ip_bucket(bucket: &mut VecDeque<IpAccessEntry>, now_ms: i64, retention_ms: i64) {
+    if retention_ms <= 0 {
+        return;
+    }
+    let cutoff = now_ms.saturating_sub(retention_ms);
+    while let Some(front) = bucket.front() {
+        if front.at_ms >= cutoff {
+            break;
+        }
+        bucket.pop_front();
+    }
+}

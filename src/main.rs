@@ -1,23 +1,24 @@
 use std::collections::HashSet;
 use std::env;
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::Request as AxRequest;
-use axum::http::{StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
- 
+
+use time::{UtcOffset, macros::format_description};
 use tracing::info;
-use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 use tracing_subscriber::fmt::time::OffsetTime;
-use time::{macros::format_description, UtcOffset};
+use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -26,10 +27,11 @@ mod app_state;
 mod caches;
 mod middleware;
 mod resolve;
+mod routes_admin;
 mod routes_blake3;
-mod utils;
-mod routes_models;
 mod routes_datasets;
+mod routes_models;
+mod utils;
 
 use app_state::AppState;
 use caches::{PATHS_INFO_CACHE, PathsInfoEntry};
@@ -72,6 +74,20 @@ async fn main() {
             env::var("LOG_JSON_BODY").as_deref(),
             Ok("0") | Ok("false") | Ok("False")
         ),
+        ip_log_retention_secs: {
+            let secs = env::var("IP_LOG_RETENTION_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1800);
+            secs.max(60)
+        },
+        ip_log_per_ip_cap: {
+            let cap = env::var("IP_LOG_PER_IP_CAP")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(200);
+            cap.max(1)
+        },
         cache_ttl: Duration::from_millis(
             env::var("CACHE_TTL_MS")
                 .ok()
@@ -100,22 +116,35 @@ async fn main() {
     }
 
     // Build router
-    let app = Router::new()
+    let mut router = Router::new()
         .route("/api/blake3/{*repo}", get(routes_blake3::get_repo_blake3))
         // Datasets catch-all under /api/datasets
         .route(
             "/api/datasets/{*rest}",
-            get(routes_datasets::get_dataset_catchall_get).post(routes_datasets::get_dataset_paths_info_post),
+            get(routes_datasets::get_dataset_catchall_get)
+                .post(routes_datasets::get_dataset_paths_info_post),
         )
         // Models catch-all under /api/models
         .route(
             "/api/models/{*rest}",
-            get(routes_models::get_model_catchall_get).post(routes_models::get_model_paths_info_post),
+            get(routes_models::get_model_catchall_get)
+                .post(routes_models::get_model_paths_info_post),
         )
         // Resolve route fallback: GET and HEAD
-        .route("/{*rest}", get(resolve::resolve_catchall).head(resolve::resolve_catchall))
+        .route(
+            "/{*rest}",
+            get(resolve::resolve_catchall).head(resolve::resolve_catchall),
+        );
+
+    router = router.route("/admin/ip-log", get(routes_admin::get_ip_log));
+
+    let state_for_layer = state.clone();
+    let app = router
         .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(state, middleware::log_requests_mw));
+        .layer(axum::middleware::from_fn_with_state(
+            state_for_layer,
+            middleware::log_requests_mw,
+        ));
 
     // Bind server
     let host = "0.0.0.0";
@@ -142,7 +171,11 @@ async fn main() {
         ),
         _ => info!(target: "fakehub", "[fake-hub] Listening on {host}:{port}"),
     }
-    axum::serve(listener, app).await.expect("server run");
+    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    axum::serve(listener, make_service)
+        .await
+        .expect("server run");
 }
 
 fn init_tracing() {
@@ -256,9 +289,13 @@ pub(crate) async fn paths_info_response(
             let cloned_items = if let Some(entry) = cachew.inner.get_mut(&cache_key) {
                 entry.at = fresh;
                 Some(entry.items.clone())
-            } else { None };
+            } else {
+                None
+            };
             cachew.evict_q.push_back((cache_key.clone(), fresh));
-            if let Some(items) = cloned_items { return Ok(items); }
+            if let Some(items) = cloned_items {
+                return Ok(items);
+            }
             return Ok(hit.items);
         }
     }
@@ -270,7 +307,10 @@ pub(crate) async fn paths_info_response(
             if let Some(vals) = utils::fs_walk::collect_paths_info_from_sidecar(&base_abs).await {
                 results = vals;
             } else {
-                return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete"));
+                return Err(http_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Sidecar missing or incomplete",
+                ));
             }
         } else {
             results.push(json!({"path": "", "type": "directory"}));
@@ -280,10 +320,15 @@ pub(crate) async fn paths_info_response(
             let trimmed = p.trim();
             if trimmed.is_empty() || trimmed == "/" || trimmed == "." {
                 if expand {
-                    if let Some(vals) = utils::fs_walk::collect_paths_info_from_sidecar(&base_abs).await {
+                    if let Some(vals) =
+                        utils::fs_walk::collect_paths_info_from_sidecar(&base_abs).await
+                    {
                         results.extend(vals);
                     } else {
-                        return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing or incomplete"));
+                        return Err(http_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Sidecar missing or incomplete",
+                        ));
                     }
                 } else {
                     results.push(json!({"path": "", "type": "directory"}));
@@ -294,17 +339,28 @@ pub(crate) async fn paths_info_response(
             let rel_norm = norm_rel.replace('\\', "/");
             if expand {
                 if let Some(sc) = sc_map.get(&rel_norm) {
-                    let Some(size_i64) = sc.get("size").and_then(|v| v.as_i64()).or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64())) else {
-                        return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing size"));
+                    let Some(size_i64) = sc.get("size").and_then(|v| v.as_i64()).or_else(|| {
+                        sc.get("lfs")
+                            .and_then(|v| v.get("size"))
+                            .and_then(|v| v.as_i64())
+                    }) else {
+                        return Err(http_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Sidecar missing size",
+                        ));
                     };
                     let mut rec = serde_json::Map::new();
                     rec.insert("path".to_string(), json!(rel_norm));
                     rec.insert("type".to_string(), json!("file"));
                     rec.insert("size".to_string(), json!(size_i64));
-                    if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) { rec.insert("oid".to_string(), json!(oid)); }
+                    if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {
+                        rec.insert("oid".to_string(), json!(oid));
+                    }
                     if let Some(lfs) = sc.get("lfs").and_then(|v| v.as_object()) {
                         let mut ldict = serde_json::Map::new();
-                        if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) { ldict.insert("oid".to_string(), json!(loid)); }
+                        if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) {
+                            ldict.insert("oid".to_string(), json!(loid));
+                        }
                         let lfs_size = lfs.get("size").and_then(|v| v.as_i64()).unwrap_or(size_i64);
                         ldict.insert("size".to_string(), json!(lfs_size));
                         rec.insert("lfs".to_string(), Value::Object(ldict));
@@ -312,21 +368,39 @@ pub(crate) async fn paths_info_response(
                     results.push(Value::Object(rec));
                 } else {
                     results.push(json!({"path": rel_norm.clone(), "type": "directory"}));
-                    let prefix = if rel_norm.is_empty() { String::new() } else { format!("{}/", rel_norm) };
+                    let prefix = if rel_norm.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}/", rel_norm)
+                    };
                     for (k, v) in sc_map.iter() {
                         if prefix.is_empty() || k.starts_with(&prefix) {
-                            let Some(size_i64) = v.get("size").and_then(|x| x.as_i64()).or_else(|| v.get("lfs").and_then(|x| x.get("size")).and_then(|x| x.as_i64())) else {
-                                return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing size"));
+                            let Some(size_i64) =
+                                v.get("size").and_then(|x| x.as_i64()).or_else(|| {
+                                    v.get("lfs")
+                                        .and_then(|x| x.get("size"))
+                                        .and_then(|x| x.as_i64())
+                                })
+                            else {
+                                return Err(http_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Sidecar missing size",
+                                ));
                             };
                             let mut rec = serde_json::Map::new();
                             rec.insert("path".to_string(), json!(k));
                             rec.insert("type".to_string(), json!("file"));
                             rec.insert("size".to_string(), json!(size_i64));
-                            if let Some(oid) = v.get("oid").and_then(|x| x.as_str()) { rec.insert("oid".to_string(), json!(oid)); }
+                            if let Some(oid) = v.get("oid").and_then(|x| x.as_str()) {
+                                rec.insert("oid".to_string(), json!(oid));
+                            }
                             if let Some(lfs) = v.get("lfs").and_then(|x| x.as_object()) {
                                 let mut ldict = serde_json::Map::new();
-                                if let Some(loid) = lfs.get("oid").and_then(|x| x.as_str()) { ldict.insert("oid".to_string(), json!(loid)); }
-                                let lfs_size = lfs.get("size").and_then(|x| x.as_i64()).unwrap_or(size_i64);
+                                if let Some(loid) = lfs.get("oid").and_then(|x| x.as_str()) {
+                                    ldict.insert("oid".to_string(), json!(loid));
+                                }
+                                let lfs_size =
+                                    lfs.get("size").and_then(|x| x.as_i64()).unwrap_or(size_i64);
                                 ldict.insert("size".to_string(), json!(lfs_size));
                                 rec.insert("lfs".to_string(), Value::Object(ldict));
                             }
@@ -336,17 +410,28 @@ pub(crate) async fn paths_info_response(
                 }
             } else {
                 if let Some(sc) = sc_map.get(&rel_norm) {
-                    let Some(size_i64) = sc.get("size").and_then(|v| v.as_i64()).or_else(|| sc.get("lfs").and_then(|v| v.get("size")).and_then(|v| v.as_i64())) else {
-                        return Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "Sidecar missing size"));
+                    let Some(size_i64) = sc.get("size").and_then(|v| v.as_i64()).or_else(|| {
+                        sc.get("lfs")
+                            .and_then(|v| v.get("size"))
+                            .and_then(|v| v.as_i64())
+                    }) else {
+                        return Err(http_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Sidecar missing size",
+                        ));
                     };
                     let mut rec = serde_json::Map::new();
                     rec.insert("path".to_string(), json!(rel_norm));
                     rec.insert("type".to_string(), json!("file"));
                     rec.insert("size".to_string(), json!(size_i64));
-                    if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) { rec.insert("oid".to_string(), json!(oid)); }
+                    if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {
+                        rec.insert("oid".to_string(), json!(oid));
+                    }
                     if let Some(lfs) = sc.get("lfs").and_then(|v| v.as_object()) {
                         let mut ldict = serde_json::Map::new();
-                        if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) { ldict.insert("oid".to_string(), json!(loid)); }
+                        if let Some(loid) = lfs.get("oid").and_then(|v| v.as_str()) {
+                            ldict.insert("oid".to_string(), json!(loid));
+                        }
                         let lfs_size = lfs.get("size").and_then(|v| v.as_i64()).unwrap_or(size_i64);
                         ldict.insert("size".to_string(), json!(lfs_size));
                         rec.insert("lfs".to_string(), Value::Object(ldict));
@@ -386,7 +471,10 @@ pub(crate) async fn paths_info_response(
         cache.evict_q.push_back((cache_key.clone(), now_i));
         cache.inner.insert(
             cache_key,
-            PathsInfoEntry { items: unique_clone, at: now_i },
+            PathsInfoEntry {
+                items: unique_clone,
+                at: now_i,
+            },
         );
     }
     Ok(unique)

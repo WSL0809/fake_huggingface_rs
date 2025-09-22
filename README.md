@@ -28,6 +28,9 @@ Rust 版 Fake HuggingFace 服务器（Axum）
   - 仅当 `LOG_BODY_ALL=1` 或 `LOG_JSON_BODY=1 且 Content-Type: application/json` 时尝试记录请求体；
   - 仅在请求头存在 `Content-Length` 且大小不超过 `4*LOG_BODY_MAX` 时读取（否则跳过以避免 OOM）；
   - 记录的正文内容按 `LOG_BODY_MAX` 截断；敏感头在 `LOG_REDACT=1` 时会脱敏。
+- IP 访问日志（默认启用）：
+  - `IP_LOG_RETENTION_SECS`：每个 IP 的保留窗口，单位秒（默认 1800，最少 60）。
+  - `IP_LOG_PER_IP_CAP`：每个 IP 至多保留的请求数（默认 200，最少 1）。
 - 缓存：`CACHE_TTL_MS`（默认 2000ms）、`PATHS_INFO_CACHE_CAP`（默认 512）、`SIBLINGS_CACHE_CAP`（默认 256）、`SHA256_CACHE_CAP`（默认 1024）。
 - 远端配置与凭据（给 `fetch_repo` 工具用）：
   - `HF_REMOTE_ENDPOINT`（默认 `https://huggingface.co`）
@@ -58,6 +61,9 @@ API
   - 仅 GET；HEAD 返回 405。
   - 返回：`{"sha256":"<hex>"}`。若文件不存在：404。
   - 忽略 `.paths-info.json`。
+- 管理 / 审计
+  - `GET /admin/ip-log?ip=<地址>&mins=<窗口分钟>&limit=<最大条数>`
+  - 返回 `window_secs` 内按时间排序的访问记录；`limit` 不超过 `IP_LOG_PER_IP_CAP`。
 
 paths-info 语义
 - 请求体：`{"paths"?: string[], "expand"?: boolean}`。
@@ -67,6 +73,7 @@ paths-info 语义
 示例
 - 下载：`curl -L http://localhost:8000/tencent/HunyuanImage-2.1/resolve/main/README.md`
 - 单文件哈希：`curl http://localhost:8000/tencent/HunyuanImage-2.1/sha256/main/config.json`
+- IP 访问日志：`curl 'http://localhost:8000/admin/ip-log?ip=127.0.0.1&mins=30&limit=50'`
 - 模型 paths-info：
   - `curl -X POST http://localhost:8000/api/models/tencent/HunyuanImage-2.1/paths-info/main -H 'content-type: application/json' -d '{"paths":["assets/"],"expand":true}'`
  - 树列举（模型）：
