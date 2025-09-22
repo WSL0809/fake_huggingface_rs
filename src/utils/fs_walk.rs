@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 
 use crate::utils::sidecar::get_sidecar_map;
 
-
 // Fast path: build full file entries from sidecar without hitting filesystem.
 // Returns None if sidecar missing/empty; caller should fall back to walking.
 pub async fn collect_paths_info_from_sidecar(base_dir: &Path) -> Option<Vec<Value>> {
@@ -15,11 +14,11 @@ pub async fn collect_paths_info_from_sidecar(base_dir: &Path) -> Option<Vec<Valu
         rec.insert("path".to_string(), json!(rel));
         rec.insert("type".to_string(), json!("file"));
         // Require size present (either top-level or lfs.size); otherwise sidecar is incomplete.
-        let Some(size) = v
-            .get("size")
-            .and_then(|x| x.as_i64())
-            .or_else(|| v.get("lfs").and_then(|x| x.get("size")).and_then(|x| x.as_i64()))
-        else {
+        let Some(size) = v.get("size").and_then(|x| x.as_i64()).or_else(|| {
+            v.get("lfs")
+                .and_then(|x| x.get("size"))
+                .and_then(|x| x.as_i64())
+        }) else {
             return None;
         };
         rec.insert("size".to_string(), json!(size));
@@ -49,17 +48,22 @@ pub async fn siblings_from_sidecar(root: &Path) -> Option<(Vec<Value>, u64)> {
     let mut total: u64 = 0;
     for (rel, v) in sc_map.iter() {
         items.push(json!({ "rfilename": rel }));
-        let Some(sz) = v
-            .get("size")
-            .and_then(|x| x.as_i64())
-            .or_else(|| v.get("lfs").and_then(|x| x.get("size")).and_then(|x| x.as_i64()))
-        else {
+        let Some(sz) = v.get("size").and_then(|x| x.as_i64()).or_else(|| {
+            v.get("lfs")
+                .and_then(|x| x.get("size"))
+                .and_then(|x| x.as_i64())
+        }) else {
             return None;
         };
-        if sz > 0 { total = total.saturating_add(sz as u64); }
+        if sz > 0 {
+            total = total.saturating_add(sz as u64);
+        }
     }
     items.sort_by(|a, b| {
-        a["rfilename"].as_str().unwrap_or("").cmp(b["rfilename"].as_str().unwrap_or(""))
+        a["rfilename"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["rfilename"].as_str().unwrap_or(""))
     });
     Some((items, total))
 }

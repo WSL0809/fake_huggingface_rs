@@ -3,16 +3,16 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use async_stream::stream;
+use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxPath, Request as AxRequest, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
+use sha2::Digest;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::error;
-use sha2::Digest;
 
 use crate::app_state::AppState;
 use crate::caches::{SHA256_CACHE, Sha256Entry};
@@ -110,7 +110,10 @@ pub(crate) async fn resolve_catchall(
         .map(|s| s.to_string());
 
     if let Some(rh) = range_header {
-        let total = match fs::metadata(&filepath).await { Ok(m) => m.len(), Err(_) => 0 };
+        let total = match fs::metadata(&filepath).await {
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        };
         match parse_range(&rh, total) {
             RangeParse::Invalid => {
                 // ignore range, return full file
@@ -150,7 +153,10 @@ pub(crate) async fn resolve_catchall(
                     }
                 };
                 let mut headers = file_headers_common(revision, length);
-                if let Err(resp) = ensure_and_insert_etag(&mut headers, &filepath, filename, left, revision, total).await {
+                if let Err(resp) =
+                    ensure_and_insert_etag(&mut headers, &filepath, filename, left, revision, total)
+                        .await
+                {
                     return resp;
                 }
                 set_content_range(&mut headers, start, end, total);
@@ -187,7 +193,9 @@ async fn full_file_response(
     let size = file.metadata().await.ok().map(|m| m.len()).unwrap_or(0);
     let stream = tokio_util::io::ReaderStream::with_capacity(file, CHUNK_SIZE);
     let mut headers = file_headers_common(revision, size);
-    if let Err(resp) = ensure_and_insert_etag(&mut headers, path, filename, repo_id, revision, size).await {
+    if let Err(resp) =
+        ensure_and_insert_etag(&mut headers, path, filename, repo_id, revision, size).await
+    {
         return resp;
     }
     let body = Body::from_stream(stream);
@@ -210,9 +218,14 @@ async fn head_file(
     filename: &str,
     filepath: &Path,
 ) -> Response {
-    let size = match fs::metadata(filepath).await { Ok(m) => m.len(), Err(_) => 0 };
+    let size = match fs::metadata(filepath).await {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
     let mut headers = file_headers_common(revision, size);
-    if let Err(resp) = ensure_and_insert_etag(&mut headers, filepath, filename, repo_id, revision, size).await {
+    if let Err(resp) =
+        ensure_and_insert_etag(&mut headers, filepath, filename, repo_id, revision, size).await
+    {
         return resp;
     }
     (StatusCode::OK, headers).into_response()
@@ -297,9 +310,13 @@ async fn sha256_file_cached(state: &AppState, p: &Path) -> io::Result<String> {
             let cloned = if let Some(entry) = cachew.inner.get_mut(&key) {
                 entry.at = fresh;
                 Some(entry.sum.clone())
-            } else { None };
+            } else {
+                None
+            };
             cachew.evict_q.push_back((key.clone(), fresh));
-            if let Some(sum) = cloned { return Ok(sum); }
+            if let Some(sum) = cloned {
+                return Ok(sum);
+            }
             return Ok(hit.sum);
         }
     }
@@ -320,13 +337,22 @@ async fn sha256_file_cached(state: &AppState, p: &Path) -> io::Result<String> {
         if cache.inner.len() >= state.sha256_cache_cap {
             while let Some((old_k, old_at)) = cache.evict_q.pop_front() {
                 if let Some(entry) = cache.inner.get(&old_k) {
-                    if entry.at == old_at { cache.inner.remove(&old_k); break; }
+                    if entry.at == old_at {
+                        cache.inner.remove(&old_k);
+                        break;
+                    }
                 }
             }
         }
         let now_i = std::time::Instant::now();
         cache.evict_q.push_back((key.clone(), now_i));
-        cache.inner.insert(key, Sha256Entry { sum: sum.clone(), at: now_i });
+        cache.inner.insert(
+            key,
+            Sha256Entry {
+                sum: sum.clone(),
+                at: now_i,
+            },
+        );
     }
     Ok(sum)
 }
@@ -355,7 +381,10 @@ async fn ensure_and_insert_etag(
     match etag_pair {
         None => {
             error!("ETag missing for {}@{}:{}", repo_id, revision, rel_path);
-            Err(http_error(StatusCode::INTERNAL_SERVER_ERROR, "ETag not available"))
+            Err(http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ETag not available",
+            ))
         }
         Some((etag, is_lfs)) => {
             let quoted = format!("\"{etag}\"");
@@ -378,8 +407,8 @@ async fn ensure_and_insert_etag(
 mod tests {
     use super::parse_range;
     use super::*;
-    use axum::routing::get;
     use axum::Router;
+    use axum::routing::get;
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
@@ -396,14 +425,21 @@ mod tests {
     fn parse_range_bad_cases() {
         use super::RangeParse;
         assert!(matches!(parse_range("bits=0-1", 10), RangeParse::Invalid));
-        assert!(matches!(parse_range("bytes=10-10", 10), RangeParse::Unsatisfiable));
-        assert!(matches!(parse_range("bytes=0-1000", 100), RangeParse::Ok(0, 99)));
+        assert!(matches!(
+            parse_range("bytes=10-10", 10),
+            RangeParse::Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_range("bytes=0-1000", 100),
+            RangeParse::Ok(0, 99)
+        ));
     }
 
     #[tokio::test]
     async fn router_head_get_with_etag() {
         // Arrange a tiny repo under fake_hub/tests_repo_etag
-        let root = dunce::canonicalize("fake_hub").unwrap_or_else(|_| std::path::PathBuf::from("fake_hub"));
+        let root = dunce::canonicalize("fake_hub")
+            .unwrap_or_else(|_| std::path::PathBuf::from("fake_hub"));
         let repo_id = "tests_repo_etag";
         let repo_dir = root.join(repo_id);
         tokio::fs::create_dir_all(&repo_dir).await.unwrap();
@@ -417,7 +453,9 @@ mod tests {
                 "lfs": {"oid": "sha256:1234", "size": size as i64}
             }]
         });
-        tokio::fs::write(&sidecar, serde_json::to_vec(&sc).unwrap()).await.unwrap();
+        tokio::fs::write(&sidecar, serde_json::to_vec(&sc).unwrap())
+            .await
+            .unwrap();
 
         // Build router with only resolve route
         let state = AppState {
@@ -444,7 +482,13 @@ mod tests {
         let uri = format!("/{repo_id}/resolve/main/x.bin");
         let resp = app
             .clone()
-            .oneshot(axum::http::Request::builder().method("HEAD").uri(&uri).body(Body::empty()).unwrap())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("HEAD")
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -461,7 +505,12 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        let cr = resp.headers().get("Content-Range").unwrap().to_str().unwrap();
+        let cr = resp
+            .headers()
+            .get("Content-Range")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(cr.starts_with("bytes 0-1/"));
         assert!(resp.headers().get("Accept-Ranges").is_some());
     }

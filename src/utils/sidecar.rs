@@ -51,7 +51,11 @@ pub async fn get_sidecar_map(base_dir: &Path) -> io::Result<SidecarMap> {
 
 // Extract an ETag string from a sidecar map for a given relative path, verifying size.
 // Returns (etag, is_lfs) if available and consistent.
-pub fn etag_from_sidecar(sc_map: &SidecarMap, rel_path: &str, expected_size: u64) -> Option<(String, bool)> {
+pub fn etag_from_sidecar(
+    sc_map: &SidecarMap,
+    rel_path: &str,
+    expected_size: u64,
+) -> Option<(String, bool)> {
     let sc = sc_map.get(rel_path)?;
     let ok_size = sc
         .get("size")
@@ -66,7 +70,11 @@ pub fn etag_from_sidecar(sc_map: &SidecarMap, rel_path: &str, expected_size: u64
         .and_then(|v| v.get("oid"))
         .and_then(|v| v.as_str())
     {
-        let etag = lfs_oid.split(':').next_back().unwrap_or(lfs_oid).to_string();
+        let etag = lfs_oid
+            .split(':')
+            .next_back()
+            .unwrap_or(lfs_oid)
+            .to_string();
         return Some((etag, true));
     }
     if let Some(oid) = sc.get("oid").and_then(|v| v.as_str()) {

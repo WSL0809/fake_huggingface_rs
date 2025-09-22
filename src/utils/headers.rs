@@ -30,4 +30,3 @@ pub fn set_content_range(headers: &mut HeaderMap, start: u64, end: u64, total: u
         HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")).unwrap(),
     );
 }
-

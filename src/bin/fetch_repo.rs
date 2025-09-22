@@ -6,13 +6,13 @@ use blake3::Hasher as Blake3Hasher;
 use clap::Parser;
 use glob::Pattern;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
+use rayon::prelude::*;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::time::Duration;
-use rayon::prelude::*;
 
 // Use mimalloc as the global allocator for the CLI binary
 #[global_allocator]
@@ -24,7 +24,6 @@ struct TreeItem {
     lfs_oid: Option<String>,
     size_bytes: Option<u64>,
 }
-
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum RepoTypeArg {
@@ -116,7 +115,6 @@ struct Opt {
     /// Ignore system proxy settings for HTTP(S) requests
     #[arg(long = "no-proxy")]
     no_proxy: bool,
-
 
     /// Generate N flat files under repo root (simple mode)
     #[arg(long = "gen-count")]
@@ -614,7 +612,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fill_size_bytes: Option<u64> = None;
     let mut fill_pattern: Vec<u8> = Vec::new();
     if opt.fill {
-        fill_size_bytes = Some(if let Some(ref s) = opt.fill_size { parse_size(s)? } else { 16 * 1024 * 1024 });
+        fill_size_bytes = Some(if let Some(ref s) = opt.fill_size {
+            parse_size(s)?
+        } else {
+            16 * 1024 * 1024
+        });
     }
     if let Some(ref s) = opt.fill_content {
         fill_pattern = s.as_bytes().to_vec();
@@ -624,20 +626,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if opt.gen_count.is_some() || opt.gen_avg_size.is_some() {
         // Simple synthetic mode: only count + average size
-        let count = match opt.gen_count { Some(c) if c > 0 => c, Some(_) => { eprintln!("Error: --gen-count must be > 0"); return Ok(()); }, None => { eprintln!("Error: --gen-count is required when using --gen-avg-size"); return Ok(()); } };
-        let avg_sz = match &opt.gen_avg_size { Some(s) => match parse_size(s) { Ok(v) => v, Err(e) => { eprintln!("Error: {e}"); return Ok(()); } }, None => { eprintln!("Error: --gen-avg-size is required with --gen-count"); return Ok(()); } };
+        let count = match opt.gen_count {
+            Some(c) if c > 0 => c,
+            Some(_) => {
+                eprintln!("Error: --gen-count must be > 0");
+                return Ok(());
+            }
+            None => {
+                eprintln!("Error: --gen-count is required when using --gen-avg-size");
+                return Ok(());
+            }
+        };
+        let avg_sz = match &opt.gen_avg_size {
+            Some(s) => match parse_size(s) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return Ok(());
+                }
+            },
+            None => {
+                eprintln!("Error: --gen-avg-size is required with --gen-count");
+                return Ok(());
+            }
+        };
 
         // In simple mode, custom fill patterns are not accepted.
-        if opt.fill_content.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+        if opt
+            .fill_content
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+        {
             eprintln!("Error: --fill-content is not accepted in simple generation mode (--gen-*)");
             return Ok(());
         }
 
         for i in 1..=count {
             let rel = format!("file_{:05}.bin", i);
-            let abs = match safe_join(&dst_root, &rel) { Ok(p) => p, Err(e) => { eprintln!("Warning: {e}"); continue; } };
-            if opt.dry_run { created_abs.push((abs, false)); continue; }
-            if let Err(e) = write_random_file(&abs, avg_sz, opt.force) { eprintln!("Warning: write {}: {}", abs.display(), e); continue; }
+            let abs = match safe_join(&dst_root, &rel) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Warning: {e}");
+                    continue;
+                }
+            };
+            if opt.dry_run {
+                created_abs.push((abs, false));
+                continue;
+            }
+            if let Err(e) = write_random_file(&abs, avg_sz, opt.force) {
+                eprintln!("Warning: write {}: {}", abs.display(), e);
+                continue;
+            }
             created_abs.push((abs, false));
         }
     } else {
@@ -668,16 +709,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .filter(|ti| keep_by_filters(&ti.path, &opt.include, &opt.exclude))
             .collect();
-        if let Some(m) = opt.max_files { filtered.truncate(m); }
+        if let Some(m) = opt.max_files {
+            filtered.truncate(m);
+        }
 
         for it in filtered {
-            let abs = match safe_join(&dst_root, &it.path) { Ok(p) => p, Err(e) => { eprintln!("Warning: {e}"); continue; } };
+            let abs = match safe_join(&dst_root, &it.path) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Warning: {e}");
+                    continue;
+                }
+            };
             let is_lfs = it.lfs_oid.is_some();
-            if opt.dry_run { created_abs.push((abs, is_lfs)); continue; }
+            if opt.dry_run {
+                created_abs.push((abs, is_lfs));
+                continue;
+            }
             let mut chosen_size: Option<u64> = None;
-            if opt.fill_from_metadata { if let Some(sz) = it.size_bytes { chosen_size = Some(sz); } }
-            if chosen_size.is_none() { chosen_size = fill_size_bytes; }
-            if let Some(sz) = chosen_size { write_filled_file(&abs, sz, &fill_pattern, opt.force)?; } else { touch_empty_file(&abs, opt.force)?; }
+            if opt.fill_from_metadata {
+                if let Some(sz) = it.size_bytes {
+                    chosen_size = Some(sz);
+                }
+            }
+            if chosen_size.is_none() {
+                chosen_size = fill_size_bytes;
+            }
+            if let Some(sz) = chosen_size {
+                write_filled_file(&abs, sz, &fill_pattern, opt.force)?;
+            } else {
+                touch_empty_file(&abs, opt.force)?;
+            }
             created_abs.push((abs, is_lfs));
         }
     }
@@ -692,7 +754,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Skeleton root: {}", dst_root.display());
     println!("Files: {}", created_abs.len());
     for (p, _) in &created_abs {
-        let rel = p.strip_prefix(&dst_root).unwrap_or(p).to_string_lossy().to_string();
+        let rel = p
+            .strip_prefix(&dst_root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .to_string();
         println!("  {rel}");
     }
 

@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RepoKind {
@@ -142,4 +142,3 @@ mod tests {
         assert!(v.get("downloads").is_some());
     }
 }
-
