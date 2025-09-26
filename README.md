@@ -92,6 +92,7 @@ paths-info 语义
 可使用二进制工具 `fetch_repo` 走 HuggingFace 公共 API 的树接口，按真实元数据在 `fake_hub` 目录下生成目录结构与占位文件：
 
 ```bash
+# 默认覆盖已存在文件
 cargo run --bin fetch_repo -- -t model user/repo
 ```
 
@@ -105,7 +106,7 @@ cargo run --bin fetch_repo -- -t model user/repo
 - `--include`/`--exclude` 多次指定的 glob 过滤（fnmatch 语义）
 - `--max-files` 限制文件数
 - `--dst` 目标根目录（默认：模型 `fake_hub/<repo>`，数据集 `fake_hub/datasets/<repo>`）
-- `--force` 覆盖现有文件
+- 默认覆盖已存在文件（原 `--force` 已移除，不再接受该参数）
 - `--dry-run` 只打印不写入
 - `--fill` 按固定大小写入重复内容（代替空文件）
 - `--fill-size` 大小（例如 `16MiB`，若未指定则默认 16MiB）
@@ -117,7 +118,7 @@ cargo run --bin fetch_repo -- -t model user/repo
    - 在仓库根下生成 N 个扁平文件（`file_00001.bin`…），每个大小为 `<SIZE>`；文件内容为随机字节；不接受 `--fill-content`。
 
 实现细节：
-- 通过 `GET /api/{models|datasets}/{repo}/tree/{rev}?recursive=1&expand=1` 获取文件列表；必要时携带 Bearer Token。
+- 通过 `GET /api/{models|datasets}/{repo}/tree/{rev}?recursive=1&expand=1` 获取文件列表；若响应含 `Link: rel="next"` 会自动跟进分页，确保完整遍历；必要时携带 Bearer Token。
 - `repo_id` 每个路径段会做 URL 安全转码；即使传入已编码的 `HunyuanImage%2D2%2E1` 也会先解码再正确编码，避免二次编码。
 - 本地实际写入的文件用于计算 `.paths-info.json`（含 sha1 与 sha256），与服务器 ETag 逻辑一致（LFS 使用 `lfs.oid` 形如 `sha256:<hex>`，普通文件使用 `oid`）。
 - 生成 `.paths-info.json` 时对文件哈希进行并行计算：按 CPU 并发切片，单线程仅占用 ~1MiB 缓冲，提升大型仓库生成速度。

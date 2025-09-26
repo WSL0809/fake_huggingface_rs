@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use glob::Pattern;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use rayon::prelude::*;
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK, USER_AGENT};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -86,10 +87,6 @@ struct Opt {
     /// Destination root (override default layout)
     #[arg(long = "dst")]
     dst: Option<PathBuf>,
-
-    /// Overwrite existing files
-    #[arg(long = "force")]
-    force: bool,
 
     /// Print actions without writing files
     #[arg(long = "dry-run")]
@@ -171,13 +168,7 @@ fn fetch_repo_tree(
 ) -> Result<Vec<TreeItem>, String> {
     let rid = quote_repo_id(repo_id);
     let rev = quote_segment(revision);
-    let url = format!(
-        "{}/api/{}/{}/tree/{}?recursive=1&expand=1",
-        endpoint.trim_end_matches('/'),
-        repo_type.as_plural(),
-        rid,
-        rev,
-    );
+    let base_endpoint = endpoint.trim_end_matches('/');
 
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -200,71 +191,103 @@ fn fetch_repo_tree(
     }
     let client = builder.build().map_err(|e| e.to_string())?;
 
-    let resp = client.get(&url).send().map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let text = resp.text().map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("HTTP {status} calling {url}\nResponse: {text}"));
-    }
+    let mut out: Vec<TreeItem> = Vec::new();
+    let mut seen_urls: HashSet<String> = HashSet::new();
+    let mut next_url = Some(format!(
+        "{}/api/{}/{}/tree/{}?recursive=1&expand=1",
+        base_endpoint,
+        repo_type.as_plural(),
+        rid,
+        rev,
+    ));
 
-    let data: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let mut items_val: Value = data.clone();
-    if data.is_object() {
-        for key in ["tree", "items", "paths"] {
-            if let Some(v) = data.get(key) {
-                if v.is_array() {
-                    items_val = v.clone();
-                    break;
+    while let Some(current_url) = next_url.take() {
+        if !seen_urls.insert(current_url.clone()) {
+            return Err(format!(
+                "Detected pagination loop while fetching {} '{}' via {current_url}",
+                repo_type.as_singular(),
+                repo_id
+            ));
+        }
+
+        let resp = client.get(&current_url).send().map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let text = resp.text().map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!("HTTP {status} calling {current_url}\nResponse: {text}"));
+        }
+
+        let data: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let mut items_val: Value = data.clone();
+        if data.is_object() {
+            // Prefer well-known array containers returned by HF APIs
+            // Some endpoints return top-level arrays; others nest under these keys.
+            for key in ["tree", "items", "paths", "siblings", "files"] {
+                if let Some(v) = data.get(key) {
+                    if v.is_array() {
+                        items_val = v.clone();
+                        break;
+                    }
                 }
             }
         }
-    }
-    let mut out: Vec<TreeItem> = Vec::new();
-    if let Some(arr) = items_val.as_array() {
-        for it in arr {
-            if let Some(obj) = it.as_object() {
-                let p = obj
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| obj.get("rfilename").and_then(|v| v.as_str()));
-                let t = obj
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| obj.get("kind").and_then(|v| v.as_str()));
-                if let (Some(path), Some(kind)) = (p, t) {
-                    let tnorm = kind.to_ascii_lowercase();
-                    if tnorm == "file" || tnorm == "blob" {
-                        let mut lfs_oid = None;
-                        let mut size_bytes: Option<u64> = None;
-                        if let Some(lfs) = obj.get("lfs").and_then(|v| v.as_object()) {
-                            lfs_oid = lfs
-                                .get("oid")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
+        if let Some(arr) = items_val.as_array() {
+            for it in arr {
+                if let Some(obj) = it.as_object() {
+                    let p = obj
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("rfilename").and_then(|v| v.as_str()));
+                    let t = obj
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("kind").and_then(|v| v.as_str()));
+                    if let (Some(path), Some(kind)) = (p, t) {
+                        let tnorm = kind.to_ascii_lowercase();
+                        if tnorm == "file" || tnorm == "blob" {
+                            let mut lfs_oid = None;
+                            let mut size_bytes: Option<u64> = None;
+                            if let Some(lfs) = obj.get("lfs").and_then(|v| v.as_object()) {
+                                lfs_oid = lfs
+                                    .get("oid")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                if size_bytes.is_none() {
+                                    if let Some(sz) = lfs.get("size").and_then(|v| v.as_i64()) {
+                                        if sz >= 0 {
+                                            size_bytes = Some(sz as u64);
+                                        }
+                                    }
+                                }
+                            }
                             if size_bytes.is_none() {
-                                if let Some(sz) = lfs.get("size").and_then(|v| v.as_i64()) {
+                                if let Some(sz) = obj.get("size").and_then(|v| v.as_i64()) {
                                     if sz >= 0 {
                                         size_bytes = Some(sz as u64);
                                     }
                                 }
                             }
+                            out.push(TreeItem {
+                                path: path.to_string(),
+                                lfs_oid,
+                                size_bytes,
+                            });
                         }
-                        if size_bytes.is_none() {
-                            if let Some(sz) = obj.get("size").and_then(|v| v.as_i64()) {
-                                if sz >= 0 {
-                                    size_bytes = Some(sz as u64);
-                                }
-                            }
-                        }
-                        out.push(TreeItem {
-                            path: path.to_string(),
-                            lfs_oid,
-                            size_bytes,
-                        });
                     }
                 }
             }
         }
+
+        next_url = extract_next_link(&headers).map(|next| {
+            if next.starts_with("http://") || next.starts_with("https://") {
+                next
+            } else if next.starts_with('/') {
+                format!("{base_endpoint}{next}")
+            } else {
+                format!("{base_endpoint}/{next}")
+            }
+        });
     }
 
     if out.is_empty() {
@@ -278,6 +301,29 @@ fn fetch_repo_tree(
         ));
     }
     Ok(out)
+}
+
+fn extract_next_link(headers: &HeaderMap) -> Option<String> {
+    for value in headers.get_all(LINK).iter() {
+        if let Ok(vstr) = value.to_str() {
+            for segment in vstr.split(',') {
+                let seg = segment.trim();
+                if !seg.starts_with('<') {
+                    continue;
+                }
+                if let Some(end) = seg.find('>') {
+                    let target = &seg[1..end];
+                    let params = seg[end + 1..].trim();
+                    for param in params.split(';') {
+                        if param.trim().eq_ignore_ascii_case("rel=\"next\"") {
+                            return Some(target.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn capitalize(s: &str) -> String {
@@ -375,10 +421,7 @@ fn ensure_dir(p: &Path) -> Result<(), String> {
     fs::create_dir_all(p).map_err(|e| e.to_string())
 }
 
-fn touch_empty_file(p: &Path, force: bool) -> Result<(), String> {
-    if p.exists() && !force {
-        return Ok(());
-    }
+fn touch_empty_file(p: &Path) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         ensure_dir(parent)?;
     }
@@ -418,10 +461,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
     })
 }
 
-fn write_filled_file(p: &Path, size_bytes: u64, pattern: &[u8], force: bool) -> Result<(), String> {
-    if p.exists() && !force {
-        return Ok(());
-    }
+fn write_filled_file(p: &Path, size_bytes: u64, pattern: &[u8]) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         ensure_dir(parent)?;
     }
@@ -475,10 +515,7 @@ fn splitmix64_next(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn write_random_file(p: &Path, size_bytes: u64, force: bool) -> Result<(), String> {
-    if p.exists() && !force {
-        return Ok(());
-    }
+fn write_random_file(p: &Path, size_bytes: u64) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         ensure_dir(parent)?;
     }
@@ -603,7 +640,6 @@ fn write_paths_info_sidecar(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
-
     // Destination root (same whether remote or spec-driven)
     let dst_root = dest_root(&opt.repo_type, &opt.repo_id, opt.dst.as_deref());
     ensure_dir(&dst_root).map_err(|e| format!("create root: {e}"))?;
@@ -675,7 +711,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 created_abs.push((abs, false));
                 continue;
             }
-            if let Err(e) = write_random_file(&abs, avg_sz, opt.force) {
+            if let Err(e) = write_random_file(&abs, avg_sz) {
                 eprintln!("Warning: write {}: {}", abs.display(), e);
                 continue;
             }
@@ -736,9 +772,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 chosen_size = fill_size_bytes;
             }
             if let Some(sz) = chosen_size {
-                write_filled_file(&abs, sz, &fill_pattern, opt.force)?;
+                write_filled_file(&abs, sz, &fill_pattern)?;
             } else {
-                touch_empty_file(&abs, opt.force)?;
+                touch_empty_file(&abs)?;
             }
             created_abs.push((abs, is_lfs));
         }
